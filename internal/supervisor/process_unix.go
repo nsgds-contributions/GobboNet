@@ -40,7 +40,7 @@ func processGroupID(cmd *exec.Cmd) int {
 //
 // The negative PID is the whole point: kill(-pgid) reaches every member,
 // including processes reparented to init after their own parent died.
-func terminateGroup(pgid int, force bool) error {
+func terminateGroupImpl(pgid int, force bool) error {
 	if pgid <= 0 {
 		return nil
 	}

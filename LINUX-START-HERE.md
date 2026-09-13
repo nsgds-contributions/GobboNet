@@ -12,7 +12,7 @@ The wizard opens in your default browser. The chat opens automatically after the
 
 Debian owns the program installation under `/usr/lib/gobbonet`; the location screen chooses the potentially much larger model/chat storage folder. Password/configuration remains under `$XDG_CONFIG_HOME/gobbonet` (normally `~/.config/gobbonet`). This revision does not migrate existing conversations between data folders.
 
-The engine is already bundled, so there is no redundant llama.cpp download. Model downloads use the existing Go catalogue downloader and its checksum policy. Nomic is optional, is checked against the SHA-256 pin in launch.bat, and lives in a separate embeddings folder so it cannot become the chat model. A second CPU engine serves embeddings on loopback port 11436.
+The engine is already bundled, so there is no redundant llama.cpp download. Model downloads use the existing Go catalogue downloader and its checksum policy. Nomic is optional, is checked against the SHA-256 pin in `internal/modelfetch`, and lives in a separate embeddings folder so it cannot become the chat model. A second CPU engine serves embeddings on loopback port 11436.
 
 Linux has no Windows Defender prompt. The wizard explains the firewall equivalent and shows a UFW command for the selected port. LAN selection changes GobboNet's listening address; it does not silently elevate privileges or edit the firewall. Both choices continue through the browser setup and open the chat. If a firewall is active, allow the selected TCP port only on your trusted network.
 

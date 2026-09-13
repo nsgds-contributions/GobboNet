@@ -5,12 +5,11 @@
 #   ./build-installer.sh                       use dist/ from build-release.sh
 #   LLAMA_CPP=/path/to/llama ./build-installer.sh
 #
-# Stages a payload folder, regenerates the model catalogue from launch.bat,
-# then runs makensis over it.
+# Stages a payload folder, then runs makensis over it.
 #
 # Everything this script checks for is checked BEFORE makensis runs. An
-# installer that compiles but ships without llama.cpp, or with a catalogue
-# that has drifted from launch.bat, is worse than one that failed to build:
+# installer that compiles but ships without llama.cpp is worse than one that
+# failed to build:
 # it fails on a stranger's PC instead of on ours.
 
 set -euo pipefail
@@ -66,11 +65,7 @@ $RELEASE
 EOF
 VERSION_QUAD="${_v1:-0}.${_v2:-0}.${_v3:-0}.${_v4:-0}"
 
-#--------------------------------------------------------------------
-# Regenerate the catalogue. Always, not just when missing -- the whole
-# point of generating it is that it cannot silently lag launch.bat.
-#--------------------------------------------------------------------
-./gen-catalog.py "$ROOT/launch.bat" models.ini
+[ -f models.ini ] || { echo "ERROR: installer/models.ini is missing" >&2; exit 1; }
 
 #--------------------------------------------------------------------
 # Stage payload
@@ -135,9 +130,10 @@ echo "  engine:   $LLAMA_CPP ($LLAMA_BACKEND)"
 "$ROOT/stage-web.sh"
 cp -r "$ROOT/web" "$PAYLOAD/web"
 
-# Scripts kept from the Windows lineage. launch.bat still owns adding further
-# models; hardware-probe.ps1 is called by the installer's probe page.
-for f in launch.bat setup-lan.bat teardown-lan.bat stop-gobbonet.bat hardware-probe.ps1 identify-model.ps1 fileserver.ps1; do
+# Scripts the installer itself invokes: the probe page runs hardware-probe.ps1,
+# the LAN page and the uninstaller run the lan scripts, and SecMain runs
+# stop-gobbonet.bat before overwriting a running install.
+for f in setup-lan.bat teardown-lan.bat stop-gobbonet.bat hardware-probe.ps1; do
     [ -f "$ROOT/$f" ] || { echo "ERROR: $f missing from $ROOT" >&2; exit 1; }
     cp "$ROOT/$f" "$PAYLOAD/$f"
 done

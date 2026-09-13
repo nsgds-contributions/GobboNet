@@ -21,9 +21,8 @@ const DefaultTOML = `# =========================================================
 # ================================================================
 #
 # This is the shared configuration file. It is written by the
-# setup scripts (launch.bat on Windows, launch.sh on Linux) but
-# can also be edited manually. After editing, restart the
-# server to pick up changes.
+# installer and by 'gobbonet setup', but can also be edited
+# manually. After editing, restart the server to pick up changes.
 #
 # You can also read and write single values without a TOML
 # parser, which is how the launcher scripts use it:
@@ -58,6 +57,15 @@ llm_url = "http://127.0.0.1:11437"
 # empty it to switch the feature off.
 search_url = "https://ollama.com/api"
 embed_url = "http://127.0.0.1:11436"
+
+# The embedding server behind embed_url. Set embed_enable = false to run
+# without one: retrieval falls back to weighted tags and chat is unaffected.
+# embed_model defaults to <data_dir>/embeddings/nomic-embed-text-v1.5.Q8_0.gguf.
+# embed_exe defaults to server_exe, then to the engine beside this binary --
+# set it only in remote mode, where server_exe is empty by definition.
+embed_enable = true
+# embed_model = ""
+# embed_exe = ""
 
 # --- Model catalogue ----------------------------------------------------
 # The list of downloadable models shown by "Add a Model" in the config
@@ -132,8 +140,10 @@ listen_port = 9066
 # not a silent fall back to remote mode.
 server_exe = ""
 
-# Maximum layers to offload to GPU (0 = CPU only, 99 = all layers).
-gpu_layers = 99
+# Layers to offload to the GPU: -1 lets llama.cpp fit the offload to your
+# free video memory, 0 is CPU only, 99 is all layers. Setting a number
+# disables the fitting, so too high a value fails to start on a small card.
+gpu_layers = -1
 
 # Context window in tokens. Must not exceed the model's maximum.
 ctx_size = 16384

@@ -1,20 +1,28 @@
 # Gobbonet — Developer Guide
 
-> A self-hosted, offline AI chat frontend for local GGUF models, running entirely on Windows via PowerShell + batch scripts. No build step, no external dependencies, no accounts.
+> A self-hosted, offline AI chat frontend for local GGUF models. No accounts, no
+> telemetry, and nothing leaves the machine except an optional web search.
+
+⚠ **This fork runs the Go server on every platform.** `fileserver.ps1` and
+`launch.bat` are deleted here, so the sections below describing them are history
+rather than instructions — kept because the Go code is a port of them and the
+reasoning still explains why it behaves as it does. For the runtime, read
+[`docs/GO_SERVER.md`](docs/GO_SERVER.md); for the Windows installer,
+[`installer/README.md`](installer/README.md).
 
 ---
 
 ## Quick start for developers
 
-```bash
-# The project root is the only directory that matters
-# All files run as-is — no npm, no bundler, no transpiler
-
-# To run:
-.\launch.bat              # Start the full app
-.\setup-lan.bat           # One-time: open firewall for phone access
-.\fileserver.ps1          # Manual server start (rarely needed — launch.bat handles this)
+```sh
+go build -o gobbonet ./cmd/gobbonet   # the server; Go 1.25, no cgo
+./stage-web.sh                        # assemble web/ from chat.html + js/ + css/
+./gobbonet                            # serve, or run the setup wizard on a first run
+./gobbonet doctor                     # paths, ports, GPU devices, firewall
 ```
+
+The frontend still runs as-is: no npm, no bundler, no transpiler. Only the
+server is built.
 
 ---
 
@@ -126,6 +134,9 @@ stylesheets; globals are shared across modules, so **load order is load-bearing*
 
 ### `fileserver.ps1` — Web server + proxy (2,055 lines)
 
+⚠ **Deleted in this fork.** Ported to `internal/server` and `internal/proxy`; kept as background.
+
+
 PowerShell using `System.Net.HttpListener` — no external runtime needed.
 
 - **Static file serving** — Serves `chat.html`, `style.css`, model metadata files
@@ -147,6 +158,9 @@ then 9066. The Go server uses the same numbers but takes them from
 `config.toml` — see `GO_SERVER.md`.
 
 ### `launch.bat` — Orchestrator (2,428 lines)
+
+⚠ **Deleted in this fork.** Its runtime half is `internal/supervisor`, its setup half `internal/setup` and `installer/`.
+
 
 Windows batch script — the entry point for end users and the coordination layer for dev work.
 
@@ -300,12 +314,18 @@ directly; point it at your own relay to interpose one.
 
 ### PowerShell conventions in `fileserver.ps1`
 
+⚠ **Deleted in this fork.** Historical.
+
+
 - **ASCII-only output** — launcher routes output through batch `echo`, which mangles non-ASCII
 - **Env vars via `Get-EnvOrDefault()`** — all configuration comes from launch.bat
 - **`HttpListener`** — no external libraries, uses .NET built-in HTTP listener
 - **Sentinel files** — `.swap-in-progress` coordinates with launch.bat's health monitor
 
 ### Batch conventions in `launch.bat`
+
+⚠ **Deleted in this fork.** Historical.
+
 
 - **Keep-open guard** — relaunches via `cmd /k` to prevent window from vanishing on error
 - **`setlocal EnableDelayedExpansion`** — needed for `!variable!` syntax in loops

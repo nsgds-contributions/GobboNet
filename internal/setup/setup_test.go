@@ -496,3 +496,66 @@ func TestAutostartAcceptsStringForm(t *testing.T) {
 		t.Error(`autostart:"on" was not honoured`)
 	}
 }
+
+// The firewall step is claimed once. A double-clicked Finish puts several
+// requests through the handler, and one elevation prompt per request would be
+// the visible failure.
+func TestFirewallJobIsClaimedOnce(t *testing.T) {
+	s := newTestServer(t)
+	s.firewallOwed = true
+	if !s.takeFirewallJob() {
+		t.Fatal("first claim returned false")
+	}
+	if s.takeFirewallJob() {
+		t.Error("second claim returned true; the prompt would be raised twice")
+	}
+}
+
+// LAN off must never schedule it, on any platform. firewallAvailable() gates
+// the other direction and is false everywhere except a Windows install that
+// shipped setup-lan.bat.
+func TestLANOffNeverSchedulesTheFirewallStep(t *testing.T) {
+	s := newTestServer(t)
+	post(t, s, "/api/password", `{"password":"hunter22","confirm":"hunter22"}`)
+	if rec := post(t, s, "/api/finish", `{"lan":false}`); rec.Code != http.StatusOK {
+		t.Fatalf("finish: got %d (%s)", rec.Code, rec.Body)
+	}
+	if s.takeFirewallJob() {
+		t.Error("LAN off scheduled the firewall step")
+	}
+}
+
+// Declining the elevation prompt must switch LAN access off, not leave the
+// server bound wide with no rule -- that combination is what makes Windows
+// raise its own "Allow access?" dialog, a second prompt for the choice just
+// refused, whose answer writes firewall rules nothing here tracks.
+func TestDeclinedPromptSwitchesLANBackOff(t *testing.T) {
+	for _, tc := range []struct {
+		name     string
+		openErr  error
+		wantHost string
+	}{
+		{"declined", ErrFirewallDeclined, "127.0.0.1"},
+		{"approved", nil, "0.0.0.0"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			s := newTestServer(t)
+			availWas, openWas := firewallAvailable, openFirewall
+			firewallAvailable = func() bool { return true }
+			openFirewall = func() error { return tc.openErr }
+			t.Cleanup(func() { firewallAvailable, openFirewall = availWas, openWas })
+
+			post(t, s, "/api/password", `{"password":"hunter22","confirm":"hunter22"}`)
+			if rec := post(t, s, "/api/finish", `{"lan":true}`); rec.Code != http.StatusOK {
+				t.Fatalf("finish: got %d (%s)", rec.Code, rec.Body)
+			}
+			cfg, err := config.Load(s.cfg.Path)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if cfg.ListenHost != tc.wantHost {
+				t.Errorf("listen_host = %q, want %q", cfg.ListenHost, tc.wantHost)
+			}
+		})
+	}
+}

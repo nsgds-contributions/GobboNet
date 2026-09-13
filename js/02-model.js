@@ -625,7 +625,7 @@ async function loadPerfSettings() {
     const a = p.auto;
     _perfStatus(p.overridden
       ? 'Custom settings in use. Auto would pick ' + a.ctxSize + ' ctx, ' +
-        a.gpuLayers + ' layers, ' + a.kvCacheType + '.'
+        (a.gpuLayers < 0 ? 'auto' : a.gpuLayers + ' layers') + ', ' + a.kvCacheType + '.'
       : 'Using automatic settings for your hardware.');
   } catch (e) {
     _perfStatus('Could not read current settings: ' + e.message, 'error');

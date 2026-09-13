@@ -31,6 +31,16 @@ Still concerned but don't know code well? We recommend tossing the github link i
 
 ## // doc.002 — yes. it is malware-shaped.
 
+> ⚠ **Read this as upstream's argument, not as a description of this fork.** The
+> résumé below is drawn from `launch.bat`, `fileserver.ps1` and the PowerShell
+> path generally, which this fork deleted. Several lines no longer describe what
+> ships here: the installer **bundles** llama.cpp and downloads no executable,
+> there is no PowerShell HTTP listener, no `SecureString` marshalling, no inline
+> P/Invoke, and no URL reservation. What survives is a Go binary that binds a
+> listener, spawns a second executable it shipped with, optionally opens a
+> firewall rule when asked, and probes the hardware once during install — still
+> malware-shaped, and the argument still holds. It is simply a shorter résumé.
+
 The temptation, when a scanner flags your clean code, is to cry false positive and post the VirusTotal link. We are not going to do that, because it would be dishonest, and because it is the boring version of this argument.
 
 GobboNet is malware-shaped. Not "technically, if you squint." Actually. Here is the résumé, and every line of it is real:

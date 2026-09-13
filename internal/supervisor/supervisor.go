@@ -281,7 +281,7 @@ func (s *Supervisor) BuildArgs(rec models.Record, modelPath string) []string {
 		"--port", s.port,
 		"--host", s.host,
 		"--ctx-size", itoaInt(tune.CtxSize),
-		"--n-gpu-layers", itoaInt(tune.GPULayers),
+		"--n-gpu-layers", gpuLayersArg(tune.GPULayers),
 		"--cache-type-k", tune.KVCacheType,
 		"--cache-type-v", tune.KVCacheType,
 		"--parallel", "1",
@@ -302,6 +302,16 @@ func (s *Supervisor) BuildArgs(rec models.Record, modelPath string) []string {
 }
 
 func itoaInt(n int) string { return fmt.Sprintf("%d", n) }
+
+// gpuLayersArg passes the engine's own "auto" rather than a number when nobody
+// has chosen one, so it fits the offload to free device memory instead of
+// aborting the fit and failing on the KV cache.
+func gpuLayersArg(n int) string {
+	if n < 0 {
+		return "auto"
+	}
+	return itoaInt(n)
+}
 
 // --- Process lifecycle -----------------------------------------------------
 
@@ -489,13 +499,23 @@ func (s *Supervisor) stop() {
 	}
 
 	if !leaderGone {
+		// Only wait out the grace period if the polite stop was actually
+		// delivered. terminateGroup reports nil when the group is already gone,
+		// so an error here means it was refused and the process is still up --
+		// waiting five seconds for a request nothing received is five seconds
+		// added to every model swap. Measured on Windows: the polite attempt
+		// failed on every swap, and each one cost the full grace period twice
+		// before forcing. "Refused" is all this knows: on Unix kill(-pgid) can
+		// report EPERM having reached some members and not others, so the group
+		// is at least partly up, not necessarily wholly.
 		if err := terminateGroup(pgid, false); err != nil {
-			log.Printf("[swap] SIGTERM to process group failed: %v", err)
-		}
-		select {
-		case <-exited:
-		case <-time.After(gracePeriod):
-			log.Printf("[swap] llama-server did not exit in %s; forcing", gracePeriod)
+			log.Printf("[swap] graceful stop of process group refused (%v); forcing", err)
+		} else {
+			select {
+			case <-exited:
+			case <-time.After(gracePeriod):
+				log.Printf("[swap] llama-server did not exit in %s; forcing", gracePeriod)
+			}
 		}
 	}
 
@@ -515,23 +535,24 @@ func (s *Supervisor) reapGroup(pgid int) {
 	}
 
 	// The leader may already have taken the polite signal; members still here
-	// have either ignored it or never received one.
+	// have either ignored it or never received one. Same rule as stop(): a
+	// refusal is not something to wait out.
 	if err := terminateGroup(pgid, false); err != nil {
-		log.Printf("[swap] SIGTERM to process group failed: %v", err)
-	}
-	if waitGroupGone(pgid, gracePeriod) {
+		log.Printf("[swap] graceful stop of process group refused (%v); forcing", err)
+	} else if waitGroupGone(pgid, gracePeriod) {
 		return
+	} else {
+		log.Printf("[swap] process group %d outlived the graceful stop; forcing", pgid)
 	}
 
-	log.Printf("[swap] process group %d outlived SIGTERM; forcing", pgid)
 	if err := terminateGroup(pgid, true); err != nil {
-		log.Printf("[swap] SIGKILL to process group failed: %v", err)
+		log.Printf("[swap] forced kill of process group failed: %v", err)
 	}
 	if !waitGroupGone(pgid, gracePeriod) {
 		// Worth shouting about: this is the state in which a swap will fail to
 		// allocate VRAM, and the cause is not something the next error message
 		// will explain.
-		log.Printf("[swap] WARNING: processes from group %d survived SIGKILL and may still hold GPU memory", pgid)
+		log.Printf("[swap] WARNING: processes from group %d survived the forced kill and may still hold GPU memory", pgid)
 	}
 }
 

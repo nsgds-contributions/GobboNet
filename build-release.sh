@@ -29,9 +29,21 @@ RELEASE="$(tr -d '[:space:]' < VERSION)"
 # from a user rather than an error from the build.
 [ -f installer/models.ini ] || {
     echo "ERROR: installer/models.ini is missing" >&2
-    echo "       Run installer/gen-catalog.py launch.bat installer/models.ini first." >&2
+    echo "       It is hand-maintained; restore it from git." >&2
     exit 1
 }
+
+# Pin the toolchain. go.mod names the language version, not the compiler, and
+# whatever `go` is on PATH will happily build with a newer one -- which produces
+# different bytes and leaves nothing in the artifact saying which.
+#
+# Unconditional, not ${GOTOOLCHAIN:-...}: every official golang image sets
+# GOTOOLCHAIN=local, so the default form yielded to the image and the same
+# script stamped go1.25.0 one day and go1.25.14 the next. Overriding it is not
+# enough on its own either -- the switch is silent when it does not happen -- so
+# assert the result and stop.
+PINNED_GO=go1.25.0
+export GOTOOLCHAIN="$PINNED_GO"
 
 GO="${GO:-go}"
 if ! command -v "$GO" >/dev/null 2>&1; then
@@ -40,6 +52,15 @@ if ! command -v "$GO" >/dev/null 2>&1; then
     done
 fi
 command -v "$GO" >/dev/null 2>&1 || { echo "no go toolchain found; set GO=/path/to/go" >&2; exit 1; }
+
+ACTUAL_GO="$("$GO" version | awk '{print $3}')"
+if [ "$ACTUAL_GO" != "$PINNED_GO" ]; then
+    echo "ERROR: toolchain is $ACTUAL_GO, not the pinned $PINNED_GO." >&2
+    echo "       GOTOOLCHAIN was set to $PINNED_GO and the switch did not happen." >&2
+    echo "       Offline, the pinned toolchain has to be in the module cache already:" >&2
+    echo "         GOTOOLCHAIN=$PINNED_GO go version    # fetches it once, with network" >&2
+    exit 1
+fi
 
 ALLOW_DIRTY=0
 [ "${1:-}" = "--allow-dirty" ] && ALLOW_DIRTY=1

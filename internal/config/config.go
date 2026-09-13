@@ -79,8 +79,13 @@ const (
 	// this change carries an explicit listen_port and keeps it.
 	DefaultListenPort = 9066
 
-	DefaultCtxSize     = 16384
-	DefaultGPULayers   = 99
+	DefaultCtxSize = 16384
+	// -1 is auto: llama-server sizes the offload to free device memory itself.
+	// Forcing a number disables that -- it aborts with "n_gpu_layers already set
+	// by user", then fails to allocate the KV cache on any card too small for
+	// the whole model. The batch launcher got away with 99 because its hardware
+	// probe picked a fitting value first; nothing does that now.
+	DefaultGPULayers   = -1
 	DefaultKVCacheType = "q8_0"
 
 	DefaultSessionTTLHours = 12
@@ -165,6 +170,20 @@ type Config struct {
 	// explicit value still wins, while `config set` keeps working.
 	RequireChecksum bool `toml:"require_checksum"`
 
+	// EmbedEnable and EmbedModel drive the embedding server the RAG retriever
+	// talks to on EmbedURL. Nothing started it before: launch.bat did on the
+	// batch path, and the Go server only ever proxied, so a Go install had
+	// semantic retrieval silently switched off (js/08-rag.js degrades to
+	// weighted tags without erroring).
+	//
+	// Plain bool, defaulting true, for the same reason as the two above.
+	// EmbedExe overrides which llama-server runs it. Without this a remote-mode
+	// install has no engine path at all -- server_exe is empty by definition --
+	// so embeddings would be skipped even with a bundled engine present.
+	EmbedEnable bool   `toml:"embed_enable"`
+	EmbedModel  string `toml:"embed_model"`
+	EmbedExe    string `toml:"embed_exe"`
+
 	// --- Chat template overrides -------------------------------------------
 	ChatTemplateName string `toml:"chat_template_name"`
 	ChatTemplateFile string `toml:"chat_template_file"`
@@ -235,6 +254,7 @@ func Default() Config {
 		// config panel makes it one click to turn off.
 		ModelCatalogURL:    catalog.DefaultURL,
 		ModelCatalogRemote: true,
+		EmbedEnable:        true,
 		// Explicitly false: see the field comment. Stated here rather than
 		// left to the zero value so that flipping the default later is a
 		// visible edit in this list.
@@ -813,6 +833,15 @@ func dirWritable(dir string) (bool, error) {
 func (c *Config) StatePath() string { return filepath.Join(c.DataDir, "state.json") }
 func (c *Config) LogFile() string   { return filepath.Join(c.DataDir, "llama-server.log") }
 
+// EmbedModelPath resolves the embedding GGUF, defaulting to the location the
+// Linux launcher and launch.bat both used.
+func (c *Config) EmbedModelPath() string {
+	if c.EmbedModel != "" {
+		return c.EmbedModel
+	}
+	return filepath.Join(c.DataDir, "embeddings", "nomic-embed-text-v1.5.Q8_0.gguf")
+}
+
 // ModelDirUsable reports whether there is a directory to enumerate GGUFs from.
 // Independent of Mode: a remote-mode install may still list local files, and a
 // local-mode install may have an empty models directory at first boot.
@@ -879,4 +908,20 @@ func splitHostPort(hostport string) (string, string, error) {
 
 func isIPLiteral(s string) bool {
 	return s != "" && net.ParseIP(s) != nil
+}
+
+// GGUFsIn lists model files in a directory. Empty for a missing or unreadable
+// one: "no models here" is the answer either way.
+func GGUFsIn(dir string) []string {
+	entries, err := os.ReadDir(dir)
+	if err != nil {
+		return nil
+	}
+	var out []string
+	for _, e := range entries {
+		if !e.IsDir() && strings.HasSuffix(strings.ToLower(e.Name()), ".gguf") {
+			out = append(out, e.Name())
+		}
+	}
+	return out
 }

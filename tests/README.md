@@ -13,27 +13,10 @@ node tests/test-markdown-render.mjs     # one suite
 for f in tests/*.mjs; do node "$f" || echo "FAILED: $f"; done   # all of them
 ```
 
-`test-engine-args.py` pins the llama-server command line across the two launch
-paths — `launch.bat`'s `:start_server` block and `Supervisor.BuildArgs`, the
-latter being what the `.deb` and the Windows installer both use. Every flag
-present on one side and not the other has to be listed as a known, reasoned
-difference or the test fails. It also holds the `-lv` / offload-detection
-pairing from #33: if GPU-offload confirmation is ever added to the Go path,
-`-lv` must arrive with it, because llama.cpp files those log lines above the
-default verbosity threshold.
-
-```sh
-python3 tests/test-engine-args.py
-```
-
-`test-prompt-safety.py` and `test-image-url-gate.mjs` cover the three fixes from
-PR #30 (John McCardle). The first pins the confirmation-prompt hygiene in
-`launch.bat` and the sanitizer routing in `identify-model.ps1` — neither can run
-on CI, since one needs an interactive Windows console and the other a real GGUF.
-The PR proposed parsing the PowerShell with its own AST under a container; this
-does the same job statically so it runs anywhere the rest of the suite does. The
-second drives the real `safeImageUrl` and asserts nothing it returns can carry a
-character that ends an HTML attribute or a CSS `url()`. Background is in
+`test-image-url-gate.mjs` covers one of the fixes from PR #30 (John McCardle):
+it drives the real `safeImageUrl` and asserts nothing it returns can carry a
+character that ends an HTML attribute or a CSS `url()`. Its companion,
+`test-prompt-safety.py`, went with the batch path. Background is in
 [`docs/changelog/CHANGELOG-1.7.3-prompt-and-sanitizer-fixes.md`](../docs/changelog/CHANGELOG-1.7.3-prompt-and-sanitizer-fixes.md).
 
 `test-remote-models.mjs` covers the model dropdown in remote mode — the shape
@@ -50,29 +33,18 @@ come from someone else.
 Each resolves the repo root from its own location, so the working directory does
 not matter.
 
-## Launcher invariants
+## Removed with the batch path
 
-`test-launch-gpu-detect.py` checks the arrangement in `launch.bat` that lets it
-confirm GPU offload: that `-lv` is passed, that the verbosity is high enough for
-llama.cpp to emit the lines the check reads, and that the check accepts more than
-one spelling of them. Background is in
-[`docs/changelog/CHANGELOG-1.7-llamacpp-log-verbosity.md`](../docs/changelog/CHANGELOG-1.7-llamacpp-log-verbosity.md).
+`test-engine-args.py`, `test-launch-gpu-detect.py`, `test-setup-lan.py` and
+`test-prompt-safety.py` all tested `launch.bat`, `fileserver.ps1` or
+`identify-model.ps1`, which this fork deleted.
 
-```sh
-python3 tests/test-launch-gpu-detect.py
-```
-
-`test-setup-lan.py` does the same job for `setup-lan.bat` and
-`teardown-lan.bat`, neither of which can be exercised on CI — they need
-Administrator on Windows and a real firewall to talk to. It pins how the web
-port is resolved, that no allow rule is ever wider than `LocalSubnet`, that
-every rule added has a matching removal in the teardown, and that no `%VAR%`
-read sits inside a parenthesised block. Background is in
-[`docs/changelog/CHANGELOG-1.7.3-lan-address-and-firewall.md`](../docs/changelog/CHANGELOG-1.7.3-lan-address-and-firewall.md).
-
-```sh
-python3 tests/test-setup-lan.py
-```
+⚠ `test-engine-args.py` was the only thing pinning the llama-server command
+line, by requiring every flag to match between the batch path and
+`Supervisor.BuildArgs` or be listed as a reasoned difference. Nothing checks
+those arguments now. A golden-file test over `BuildArgs`, plus a pass over
+`installer/models.ini` asserting every entry yields a usable command, would
+restore the cover without needing the batch file back.
 
 ## Preview pages (`preview/`)
 

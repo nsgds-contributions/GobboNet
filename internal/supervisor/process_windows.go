@@ -41,7 +41,7 @@ func processGroupID(cmd *exec.Cmd) int {
 //
 // taskkill exits non-zero when the PID is already gone, which is success here,
 // so an error is only reported when the tree is demonstrably still present.
-func terminateGroup(pgid int, force bool) error {
+func terminateGroupImpl(pgid int, force bool) error {
 	if pgid <= 0 {
 		return nil
 	}

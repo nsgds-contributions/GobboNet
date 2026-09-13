@@ -3,6 +3,7 @@
 package supervisor
 
 import (
+	"errors"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -206,5 +207,54 @@ func TestSuperviseTreeIsSafeOnUnix(t *testing.T) {
 
 	if err := superviseTree(cmd); err != nil {
 		t.Errorf("superviseTree(running cmd) = %v, want nil", err)
+	}
+}
+
+// A refused graceful stop must be escalated at once, not waited out.
+//
+// This is the Linux-runnable form of a Windows-only defect: taskkill without
+// /F is refused on every swap there, and reapGroup used to spend the whole
+// gracePeriod waiting for a stop nothing had accepted.
+//
+// The clock is the assertion, and it is taken at the moment the forced call
+// arrives rather than when reapGroup returns. reapGroup legitimately waits
+// afterwards to confirm the tree is gone, and that wait depends on the leader
+// being reaped -- timing the whole call would measure the harness, not the
+// behaviour. The first version of this test did exactly that and failed for
+// the wrong reason.
+func TestRefusedGracefulStopEscalatesWithoutWaiting(t *testing.T) {
+	pgid, helperPID, leader := startTreeWithHelper(t)
+
+	// Reap the leader as the real supervisor does, or it lingers as a zombie
+	// that kill(-pgid, 0) still reports as a live group member.
+	go func() { _ = leader.Wait() }()
+
+	refused := errors.New("stop refused, group still up")
+	var politeCalls, forcedCalls int
+	var escalatedAfter time.Duration
+	realTerminate := terminateGroup
+	began := time.Now()
+	terminateGroup = func(pg int, force bool) error {
+		if !force {
+			politeCalls++
+			return refused
+		}
+		forcedCalls++
+		escalatedAfter = time.Since(began)
+		return realTerminate(pg, true)
+	}
+	t.Cleanup(func() { terminateGroup = realTerminate })
+
+	(&Supervisor{}).reapGroup(pgid)
+
+	if politeCalls != 1 || forcedCalls != 1 {
+		t.Fatalf("polite=%d forced=%d, want 1 and 1", politeCalls, forcedCalls)
+	}
+	if escalatedAfter > time.Second {
+		t.Errorf("escalated only after %s; a refusal must not cost the %s grace period",
+			escalatedAfter, gracePeriod)
+	}
+	if !waitFor(func() bool { return !alive(helperPID) }, 2*time.Second) {
+		t.Errorf("helper %d survived: the forced path did not actually kill the tree", helperPID)
 	}
 }

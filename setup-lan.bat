@@ -55,7 +55,7 @@ echo   connect to the chat over your local network.
 echo.
 echo   Access is limited to devices on your local subnet,
 echo   and the chat itself requires a password (set in
-echo   launch.bat). The wider internet cannot reach it, and
+echo   GobboNet). The wider internet cannot reach it, and
 echo   nobody on your network gets in without the password.
 echo.
 echo   NOTE: if you re-run this after an earlier version, it
@@ -347,8 +347,11 @@ echo  [..] Adding URL ACL reservations...
 :: the web-port failures down the wrong path.
 :: ---------------------------------------------------------------
 
-:: (no search proxy ACL -- nothing binds that port now)
-call :add_urlacl !WEB_PORT! "file server"
+:: No URL ACL is added any more. HTTP.SYS reservations existed for the
+:: PowerShell server, which is gone; gobbonet.exe binds a socket directly and
+:: needs none. A machine-wide reservation for Everyone with no consumer is
+:: exactly what the uninstaller warns can 503 other software.
+:: The teardown script still removes any left by an earlier install.
 
 :: Upgrade cleanup. Installs before 1.5.5 defaulted to 8080 and left a URL
 :: ACL behind for it. It is harmless but it is also a reservation on a port
@@ -399,7 +402,7 @@ if defined PORT_RESERVED (
     echo.
     echo        a^) Use a different port. Before launching, run:
     echo             set GEMMA_LISTEN_PORT=8420
-    echo           then start launch.bat from that same window.
+    echo           then start GobboNet from that same window.
     echo.
     echo        b^) Reserve !WEB_PORT! back for normal use, then REBOOT:
     echo             netsh int ipv4 add excludedportrange protocol=tcp startport=!WEB_PORT! numberofports=1
@@ -416,17 +419,33 @@ if defined PORT_RESERVED (
 
 echo.
 echo  ====================================================
-echo   All done! You can now run launch.bat normally.
+echo   All done! The Windows firewall now allows GobboNet.
 echo.
 echo   Your phone will be able to connect at:
-echo     http://%COMPUTERNAME%.local:!WEB_PORT!  [recommended]
-echo     http://YOUR_PC_IP:!WEB_PORT!            [alternate]
+echo     http://YOUR_PC_IP:!WEB_PORT!            [use this]
+echo     http://%COMPUTERNAME%.local:!WEB_PORT!  [iPhone only]
 echo.
-echo   The .local URL is preferred -- it stays the same
-echo   even when your PC's IP rotates, so your phone's
-echo   bookmark and saved chats never break.
+echo   GobboNet prints the exact address when it starts, and
+echo   gobbonet.exe doctor lists every address a phone could try.
 echo.
-echo   launch.bat will show the exact URLs when it starts.
+echo   The .local name resolves from an iPhone or a Mac only.
+echo   Android has no mDNS resolver, so Chrome there answers
+echo   DNS_PROBE_FINISHED_NXDOMAIN no matter what this PC
+echo   advertises. Do not rely on it. To stop the numeric
+echo   address rotating, give this PC a fixed DHCP lease in
+echo   your router. That is what really keeps a bookmark alive.
+echo.
+echo   ONE MORE STEP if you ran this script by hand: the
+echo   firewall is only half of LAN access. GobboNet must also
+echo   be told to listen on the network, or these rules stand
+echo   in front of a closed door and your phone times out with
+echo   no error anywhere. In a NORMAL command window -- not
+echo   this Administrator one, which may write to a different
+echo   user's settings -- run:
+echo     gobbonet.exe config set listen_host 0.0.0.0
+echo   then restart GobboNet. Choosing LAN access in the setup
+echo   wizard does both halves for you. gobbonet.exe doctor
+echo   reports it when only one half is done.
 echo.
 echo   To UNDO these changes later, right-click this and
 echo   choose "Run as administrator":

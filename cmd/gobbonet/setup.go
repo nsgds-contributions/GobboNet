@@ -117,6 +117,27 @@ func cmdSetup(argv []string) error {
 	return nil
 }
 
+// firstRunSetup is the wizard as bare `gobbonet` invokes it: no flags, browser
+// opened, catalogue and engine discovered beside the binary.
+func firstRunSetup(configPath string, force bool) error {
+	catPath := catalog.Discover()
+	if catPath == "" {
+		return fmt.Errorf("setup has not run yet and no model catalogue was found.\n" +
+			"    Put models.ini beside the binary, or run: gobbonet setup --catalog PATH")
+	}
+	// Force matters for the re-offer: setup is already marked complete there, and
+	// without it Run reports AlreadyComplete and returns, leaving the install
+	// exactly as unusable as it was.
+	_, err := setup.Run(setup.Options{
+		ConfigPath:  configPath,
+		CatalogPath: catPath,
+		ServerExe:   config.DiscoverServerExe(),
+		Force:       force,
+		Out:         os.Stdout,
+	})
+	return err
+}
+
 // errSetupIncomplete carries the exit status for --status without printing
 // anything. run() turns a non-nil error into exit 1, which is exactly the
 // signal a shell `if` needs.

@@ -829,13 +829,24 @@ func TestPerfResetRemovesTheOverride(t *testing.T) {
 
 // A rejected value must not be written, and must come back as {"error": ...},
 // which is the envelope _perfStatus renders.
+// -1 is auto, and the settings panel must be able to choose it: pinning a layer
+// count is what disables llama.cpp's own fit and strands cards too small for
+// the whole model.
+func TestPerfAcceptsAutoGpuLayers(t *testing.T) {
+	srv, _ := newTestServer(t)
+	rec := do(t, srv, http.MethodPost, "/perf", strings.NewReader(`{"gpuLayers":-1}`))
+	if rec.Code != http.StatusOK {
+		t.Fatalf("got %d, want 200; body: %s", rec.Code, rec.Body.String())
+	}
+}
+
 func TestPerfRejectsOutOfRange(t *testing.T) {
 	srv, cfg := newTestServer(t)
 
 	for _, tc := range []struct{ name, body string }{
 		{"ctxSize below the floor", `{"ctxSize":16}`},
 		{"ctxSize past any model", `{"ctxSize":99999999}`},
-		{"negative gpuLayers", `{"gpuLayers":-1}`},
+		{"gpuLayers below auto", `{"gpuLayers":-2}`},
 		{"gpuLayers past the cap", `{"gpuLayers":1000}`},
 		{"unknown kvCacheType", `{"kvCacheType":"q2_k"}`},
 		{"not JSON at all", `ctxSize=8192`},

@@ -4,9 +4,15 @@
 chat state across devices, and — when you ask it to — starts and supervises
 llama.cpp itself.
 
-It replaces the runtime half of `fileserver.ps1` + `launch.bat`'s monitor loop.
-The setup half (hardware probe, model download) still lives in the launcher
-scripts.
+It replaces `fileserver.ps1` and `launch.bat` outright: this fork deletes both,
+so the Go server is the runtime on Windows exactly as it already was on Linux.
+
+> ⚠ **This page ships as `README.md` inside every release archive, and parts of
+> it were written mid-migration.** Where it describes `launch.bat` or
+> `fileserver.ps1` as a live component, read that as history. First-run setup is
+> now the web wizard in `internal/setup` on all platforms — password, backend,
+> chat model and retrieval model — and only the hardware probe is still a
+> script, run by the Windows installer. The runtime sections below are current.
 
 ## Build
 
@@ -167,7 +173,7 @@ First hit wins:
 2. `$GOBBONET_CONFIG` (`$GEMMA_CONFIG` still works, with a deprecation warning)
 3. `$XDG_CONFIG_HOME/gobbonet/config.toml`
 4. `~/.config/gobbonet/config.toml`
-5. `./config.toml` — matches the Windows layout, next to `launch.bat`
+5. `./config.toml` — in the working directory, not beside the binary
 
 Config and data are deliberately separate: config in `~/.config/gobbonet`, data
 (state backup, models, logs) in `~/.local/share/gobbonet`. Nothing large is ever
@@ -250,29 +256,22 @@ linux/amd64, linux/arm64, windows/amd64, darwin/arm64 and darwin/amd64, and ever
 runtime feature above works identically on all five: auth, state sync, generation
 jobs, proxying, hot-swap, GGUF identification, process supervision.
 
-**First-run setup does not.** Hardware detection (`hardware-probe.ps1`) and the
-guided model download (`launch.bat`, wrapped by the NSIS wizard) are PowerShell
-and batch, and they are what turn a bare binary into a working install. On
-Windows the installer runs them for you. On Linux and macOS there is currently no
-equivalent: you write `config.toml` yourself and fetch a GGUF yourself.
+**First-run setup now does too.** The web wizard in `internal/setup` asks for the
+password, the backend, a chat model and the retrieval model, downloads both and
+writes the config — the same flow on every platform. ⚠ The two are not verified
+alike: the retrieval model has a pinned SHA-256, while the chat catalogue
+(`installer/models.ini`) carries none, so a chat download is checked against the
+checksum HuggingFace publishes for the file, and against a size floor when that
+is unreachable. `gobbonet` runs it by itself when setup has not happened, and
+`gobbonet setup --force` re-runs it later.
 
-That is a deliberate scope line, not an oversight. Bringing the two into line
-means one of:
-
-1. **Leave it.** Cheapest. Non-Windows first run stays manual.
-2. **Port detection to Go** as `gobbonet probe`, emitting the same JSON and INI
-   (`nvidia-smi`, `/sys/class/drm`, `sysctl` on Darwin). NSIS would then call the
-   Go binary, `hardware-probe.ps1` retires, and all three platforms share one
-   flow — at the cost of owning hardware-detection edge cases that upstream's
-   probe spent ~2,000 lines learning, on platforms it never targeted.
-3. **Port only the catalogue.** It is already machine-readable as
-   `installer/models.ini`; a `gobbonet setup` CLI could drive the download while
-   probing stays behind a platform-specific interface.
-
-Current state is (1). (2) is the one that actually retires `launch.bat` and gets
-Unix-philosophy parity rather than a Windows installer with two second-class
-ports hanging off it, and is the recommended next step — as its own piece of
-work, not folded into a release.
+One piece is still platform-specific: hardware detection is
+`hardware-probe.ps1`, run by the Windows installer, and there is no equivalent
+elsewhere. ⚠ Nothing reads its output — see `installer/README.md`. Porting it to
+Go as `gobbonet probe` would give all three platforms one flow and give the
+wizard something to preselect a model from, at the cost of owning
+hardware-detection edge cases that upstream's probe spent ~2,000 lines learning.
+That is the recommended next step, as its own piece of work.
 
 ## Passwords
 

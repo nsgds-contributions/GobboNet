@@ -35,6 +35,7 @@ func cmdUninstall(argv []string) error {
 	configPath := stringFlag(fs, "config", "path to config.toml")
 	keepModels := fs.Bool("keep-models", false, "keep downloaded models")
 	removeModels := fs.Bool("remove-models", false, "remove downloaded models without asking")
+	modelsOnly := fs.Bool("models-only", false, "remove only the downloaded models, leaving settings and conversations")
 	yes := fs.Bool("yes", false, "do not prompt; implies keeping models unless -remove-models")
 	if err := fs.Parse(argv); err != nil {
 		return err
@@ -47,18 +48,30 @@ func cmdUninstall(argv []string) error {
 	// is to clean up, and the default locations are known without it.
 	dataDir := config.DataDir()
 	configDir := config.ConfigDir()
+	configFile := "" // a config found outside configDir; removed as a file
 	modelDir := filepath.Join(dataDir, "models")
+	embedDir := filepath.Join(dataDir, "embeddings")
 
-	if cfg, err := config.Load(*configPath); err == nil {
+	// Discover first. Passing the bare flag meant that without --config nothing
+	// was ever loaded, so every path fell back to a default -- and three of the
+	// four defaults are right, which is why this hid. The fourth is model_dir,
+	// which the Windows installer always sets away from the default, so
+	// "delete the models" quietly deleted nothing.
+	discovered, _ := config.Discover(*configPath)
+	if cfg, err := config.Load(discovered); err == nil {
 		if cfg.DataDir != "" {
 			dataDir = cfg.DataDir
 			modelDir = filepath.Join(dataDir, "models")
+			embedDir = filepath.Join(dataDir, "embeddings")
+		}
+		if cfg.EmbedModel != "" {
+			embedDir = filepath.Dir(cfg.EmbedModel)
 		}
 		if cfg.ModelDir != "" {
 			modelDir = cfg.ModelDir
 		}
 		if cfg.Path != "" {
-			configDir = filepath.Dir(cfg.Path)
+			configFile = cfg.Path
 		}
 	}
 
@@ -66,9 +79,34 @@ func cmdUninstall(argv []string) error {
 	fmt.Println("  Removing GobboNet's user data.")
 	fmt.Println()
 	fmt.Println("    config:        ", configDir)
+	if outsideDir(configFile, configDir) {
+		fmt.Println("    also:          ", configFile)
+	}
 	fmt.Println("    conversations: ", dataDir)
 	fmt.Println("    models:        ", modelDir)
 	fmt.Println()
+
+	// The NSIS uninstaller asks about models separately from settings, and used
+	// to delete its own folder -- which left the retrieval model behind, on a
+	// path only this binary knows. It calls this instead.
+	if *modelsOnly {
+		gone := 0
+		for _, d := range []string{modelDir, embedDir} {
+			if _, err := os.Stat(d); err != nil {
+				continue
+			}
+			if err := os.RemoveAll(d); err != nil {
+				fmt.Printf("  [WARN] Could not remove %s: %v\n", d, err)
+				continue
+			}
+			fmt.Printf("  [OK] Removed %s\n", d)
+			gone++
+		}
+		if gone == 0 {
+			fmt.Println("  [OK] No downloaded models found.")
+		}
+		return nil
+	}
 
 	// --- the parts that go without asking ---------------------------------
 	removed := 0
@@ -99,15 +137,19 @@ func cmdUninstall(argv []string) error {
 		}
 	}
 
-	if err := os.RemoveAll(configDir); err != nil {
-		fmt.Printf("  [WARN] Could not remove %s: %v\n", configDir, err)
-	} else {
-		fmt.Println("  [OK] Config and stored password removed.")
-	}
+	removeConfig(configDir, configFile)
 
 	// --- models: the expensive thing --------------------------------------
+	//
+	// The retrieval model sits outside modelDir so an embedder can never be
+	// picked as a chat model, but it is still something the user downloaded.
+	// Removing "the models" and leaving it behind is how someone ends up being
+	// told embeddings are ready on an install they just stripped.
 	modelsPresent := false
 	if entries, err := os.ReadDir(modelDir); err == nil && len(entries) > 0 {
+		modelsPresent = true
+	}
+	if entries, err := os.ReadDir(embedDir); err == nil && len(entries) > 0 {
 		modelsPresent = true
 	}
 
@@ -126,18 +168,21 @@ func cmdUninstall(argv []string) error {
 	default:
 		deleteModels = askYesNo(fmt.Sprintf(
 			"  Delete the downloaded models in %s too?\n"+
-				"  These run to tens of gigabytes and are slow to fetch again. [y/N]: ", modelDir))
+				"  This includes the 146 MB retrieval model in %s.\n"+
+				"  These run to tens of gigabytes and are slow to fetch again. [y/N]: ",
+			modelDir, embedDir))
 	}
 
 	switch {
 	case !modelsPresent:
 		fmt.Println("  [OK] No downloaded models found.")
 	case deleteModels:
-		if err := os.RemoveAll(modelDir); err != nil {
-			fmt.Printf("  [WARN] Could not remove %s: %v\n", modelDir, err)
-		} else {
-			fmt.Println("  [OK] Models removed.")
+		for _, d := range []string{modelDir, embedDir} {
+			if err := os.RemoveAll(d); err != nil {
+				fmt.Printf("  [WARN] Could not remove %s: %v\n", d, err)
+			}
 		}
+		fmt.Println("  [OK] Models removed, including the retrieval model.")
 	default:
 		fmt.Printf("  [--] Models kept at %s\n", modelDir)
 	}
@@ -186,4 +231,36 @@ func askYesNo(prompt string) bool {
 		return true
 	}
 	return false
+}
+
+// outsideDir reports whether file exists and does not live directly in dir.
+func outsideDir(file, dir string) bool {
+	return file != "" && filepath.Clean(filepath.Dir(file)) != filepath.Clean(dir)
+}
+
+// removeConfig clears the config directory GobboNet owns, and removes a config
+// found anywhere else as a pair of files.
+//
+// Deleting the *directory* of a discovered config takes whatever else lives
+// there. Discover resolves --config, GOBBONET_CONFIG, and failing those a
+// config.toml in the working directory -- none of which GobboNet owns, and one
+// of which can be the install folder. Verified: `uninstall --config
+// <dir>/config.toml` removed the whole of <dir>, including the binaries and a
+// models folder the same run had been told to keep.
+func removeConfig(dir, file string) {
+	if err := os.RemoveAll(dir); err != nil {
+		fmt.Printf("  [WARN] Could not remove %s: %v\n", dir, err)
+	} else {
+		fmt.Println("  [OK] Config and stored password removed.")
+	}
+	if !outsideDir(file, dir) {
+		return
+	}
+	for _, p := range []string{file, config.PerfPath(file)} {
+		if err := os.Remove(p); err == nil {
+			fmt.Printf("  [OK] Removed %s\n", p)
+		} else if !os.IsNotExist(err) {
+			fmt.Printf("  [WARN] Could not remove %s: %v\n", p, err)
+		}
+	}
 }

@@ -1,6 +1,7 @@
 package main
 
 import (
+	"context"
 	"flag"
 	"fmt"
 	"io"
@@ -9,7 +10,9 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"regexp"
 	"runtime"
+	"sort"
 	"strconv"
 	"strings"
 	"time"
@@ -33,6 +36,116 @@ import (
 // and exact commands. It changes nothing: someone running a diagnostic on a
 // broken install must not have to wonder whether the diagnostic broke it
 // further.
+// reportOffload answers "will this actually use the GPU", which nothing did on
+// the Go path. launch.bat raised the engine's log verbosity and grepped for the
+// offload line; the pinned build prints nothing about offload at its default
+// verbosity and exposes nothing over /props.
+//
+// The engine can simply be asked. --list-devices enumerates what it will
+// offload to, which answers "will it" rather than "could it" -- the backend
+// libraries beside it are only the explanation when the answer is none.
+func reportOffload(exe string, gpuLayers int) {
+	devices, err := listDevices(exe)
+	backends, berr := gpuBackendsBeside(exe)
+
+	switch {
+	case err == nil && len(devices) > 0:
+		fmt.Printf("  gpu devices: %s\n", devices[0])
+		for _, d := range devices[1:] {
+			fmt.Printf("               %s\n", d)
+		}
+		switch {
+		case gpuLayers == 0:
+			fmt.Println("               gpu_layers is 0, so none of them will be used.")
+		case gpuLayers < 0:
+			fmt.Println("               gpu_layers is auto; llama.cpp fits the offload to free VRAM.")
+		default:
+			fmt.Printf("               gpu_layers is %d, which overrides llama.cpp's own fitting.\n", gpuLayers)
+		}
+	case err == nil && gpuLayers > 0:
+		fmt.Println("  gpu devices: NONE -- every model will run on the processor, slowly")
+		if berr == nil && len(backends) == 0 {
+			// The hazard the build script guards against: the CPU-only archive
+			// has the same filenames as the GPU one minus a library.
+			fmt.Println("               No GPU backend shipped beside the engine either, so this")
+			fmt.Println("               is the CPU-only build. Reinstall with the GPU one.")
+		} else {
+			fmt.Println("               A GPU backend is present, so this is a driver or")
+			fmt.Println("               hardware problem rather than the wrong engine build.")
+		}
+	case err == nil && gpuLayers == 0:
+		fmt.Println("  gpu devices: none, and gpu_layers is 0 -- CPU by configuration")
+	case err == nil:
+		fmt.Println("  gpu devices: none -- everything runs on the processor")
+	default:
+		// A hung or missing engine must not turn doctor into a failure.
+		fmt.Printf("  gpu devices: could not ask the engine (%v)\n", err)
+	}
+}
+
+// listDevices asks the engine what it can offload to. Bounded, because a broken
+// GPU driver can hang the enumeration rather than fail it.
+func listDevices(exe string) ([]string, error) {
+	ctx, cancel := context.WithTimeout(context.Background(), 20*time.Second)
+	defer cancel()
+	out, err := exec.CommandContext(ctx, exe, "--list-devices").CombinedOutput()
+	if err != nil && len(out) == 0 {
+		return nil, err
+	}
+	var devices []string
+	seen := false
+	for _, line := range strings.Split(string(out), "\n") {
+		t := strings.TrimSpace(line)
+		if strings.HasPrefix(t, "Available devices:") {
+			seen = true
+			continue
+		}
+		if !seen || t == "" || t == "(none)" {
+			continue
+		}
+		// Keep the whole line. The identifier alone ("Vulkan1") is useless to
+		// someone deciding whether a model fits; the name and free memory that
+		// follow the colon are the entire point.
+		devices = append(devices, t)
+	}
+	if !seen {
+		return nil, fmt.Errorf("engine did not list devices")
+	}
+	return devices, nil
+}
+
+// gpuAccelerators are the ggml backend stems that actually offload. An
+// allowlist, not a denylist: ggml-rpc and ggml-blas match "ggml-<something>"
+// and ship in every archive including the CPU-only one, so excluding known
+// non-accelerators would silently pass the exact build this is meant to catch.
+var gpuAccelerators = []string{"vulkan", "cuda", "hip", "rocm", "metal", "sycl", "opencl", "cann", "musa", "kompute", "webgpu"}
+
+func gpuBackendsBeside(exe string) ([]string, error) {
+	entries, err := os.ReadDir(filepath.Dir(exe))
+	if err != nil {
+		return nil, err
+	}
+	var found []string
+	for _, e := range entries {
+		low := strings.ToLower(e.Name())
+		if !strings.HasSuffix(low, ".dll") && !strings.Contains(low, ".so") && !strings.HasSuffix(low, ".dylib") {
+			continue
+		}
+		stem := strings.TrimPrefix(strings.TrimPrefix(low, "lib"), "ggml-")
+		if stem == low {
+			continue
+		}
+		for _, a := range gpuAccelerators {
+			if strings.HasPrefix(stem, a) {
+				found = append(found, e.Name())
+				break
+			}
+		}
+	}
+	sort.Strings(found)
+	return found, nil
+}
+
 func cmdDoctor(argv []string) error {
 	fs := flag.NewFlagSet("gobbonet doctor", flag.ContinueOnError)
 	configPath := stringFlag(fs, "config", "path to config.toml")
@@ -85,6 +198,7 @@ func cmdDoctor(argv []string) error {
 			probe := cfg
 			if from, healed := probe.HealServerExe(); healed {
 				fmt.Printf("  repairable:  yes -- %s\n", probe.ServerExe)
+				defer reportOffload(probe.ServerExe, cfg.GPULayers)
 				fmt.Println("               Starting the server will adopt that and rewrite the config.")
 				_ = from
 			} else {
@@ -94,6 +208,7 @@ func cmdDoctor(argv []string) error {
 			}
 		}
 		fmt.Printf("  llm_url:     %s\n", cfg.LLMURL)
+		reportOffload(cfg.ServerExe, cfg.GPULayers)
 	}
 	fmt.Println()
 
@@ -110,8 +225,8 @@ func cmdDoctor(argv []string) error {
 		// Not a fault, and not worth a path the user could go looking for.
 		// The sidecar's only readers are the Windows LAN scripts (NEW-3).
 		fmt.Println("  .gobbonet-port: not used on this platform")
-		fmt.Println("               Only setup-lan.bat and launch.bat read it, and both are")
-		fmt.Println("               Windows-only. The port here comes from listen_port above.")
+		fmt.Println("               Only setup-lan.bat reads it, and it is Windows-only.")
+		fmt.Println("               The port here comes from listen_port above.")
 	case sidecar == "":
 		// Only when os.Executable fails, which is close to never.
 	case recorded == 0:
@@ -156,7 +271,7 @@ func cmdDoctor(argv []string) error {
 	reportLANAddrs(os.Stdout, cfg)
 	switch runtime.GOOS {
 	case "windows":
-		reportFirewall(os.Stdout, cfg.ListenPort)
+		reportFirewall(os.Stdout, cfg)
 	case "linux":
 		reportLinuxFirewall(os.Stdout, cfg.ListenPort)
 	}
@@ -350,19 +465,107 @@ func isLoopbackConfigured(host string) bool {
 // answer it correctly. Block beats Allow in Windows Firewall, so those rules
 // override the port rule setup-lan.bat adds, and setup-lan.bat still reports
 // [OK] for everything it did. Nothing on the machine would say otherwise.
-func reportFirewall(w io.Writer, port int) {
+// inboundRules dumps every inbound rule. The second return is false when netsh
+// could not be run at all, which is not the same answer as "no rules" and must
+// not be reported as one.
+func inboundRules() (string, bool) {
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+	out, err := exec.CommandContext(ctx, "netsh", "advfirewall", "firewall", "show",
+		"rule", "name=all", "dir=in").CombinedOutput()
+	if err != nil && len(out) == 0 {
+		return "", false
+	}
+	return string(out), true
+}
+
+// firewallMentionsUs reports whether any inbound rule references GobboNet or
+// this port.
+//
+// Deliberately not a test of whether traffic is allowed. setup-lan.bat's two
+// rules are not the only ones that matter: Windows writes its own, named after
+// the executable, when someone answers the "Allow access?" prompt at first
+// launch, and a non-admin install means that prompt is how most machines end up
+// configured. Observed on a test machine -- both setup-lan.bat rules removed,
+// two rules named gobbonet.exe present, and the phone connecting fine while a
+// check that looked only for Gemma4-Web insisted it could not.
+//
+// Matching on a name and a number rather than on "Allow" or "Enabled" is also
+// what makes this locale-proof: netsh translates its field values, so reading
+// them would misfire on a German or French machine exactly as matching a header
+// does. The cost is that a Block rule looks the same as an Allow rule here --
+// countBlockedGobbonetRules is checked first for that, but see its own note: it
+// is not locale-proof, so on a French or Spanish machine a blocked install goes
+// unwarned. Silence, which is the direction to fail in.
+//
+// Read the name literally: the port half matches the number anywhere in the
+// dump, including another program's LocalPort or somebody's RemotePort. This
+// says something mentions 9066, not that anything opens it.
+func firewallMentionsUs(out string, port int) bool {
+	return strings.Contains(strings.ToLower(out), "gobbonet") || portMentioned(out, port)
+}
+
+// portMentioned looks for the port as a whole number in netsh output.
+//
+// A substring match reports a rule for 9066 as covering 906, 66 and 6, and
+// matches digits in the rule name besides. Anchoring on the "LocalPort" label
+// instead is not an option: netsh translates its own headers, which is why
+// setup-lan.bat matches URLs rather than labels.
+func portMentioned(out string, port int) bool {
+	return regexp.MustCompile(`\b` + strconv.Itoa(port) + `\b`).MatchString(out)
+}
+
+// warnIfFirewallClosed is the startup half of doctor's LAN cross-check. The
+// wizard says its piece once; this runs on every start, so it also catches a
+// declined elevation prompt, a rule opened for a port that later changed, and a
+// rule someone removed.
+func warnIfFirewallClosed(port int) {
+	if runtime.GOOS != "windows" {
+		return
+	}
+	out, ok := inboundRules()
+	if !ok {
+		return
+	}
+	if n := countBlockedGobbonetRules(out); n > 0 {
+		fmt.Println()
+		fmt.Printf(" [!]  %d inbound firewall rule(s) block GobboNet. A Block rule beats\n", n)
+		fmt.Println("      any Allow rule, so a phone cannot connect whatever else is set.")
+		fmt.Println("      `gobbonet doctor` prints the command that removes them.")
+		return
+	}
+	if firewallMentionsUs(out, port) {
+		return
+	}
+	fmt.Println()
+	fmt.Println(" [!]  No Windows firewall rule mentions GobboNet or this port.")
+	fmt.Println("      If a phone cannot reach the address above, that is the first")
+	fmt.Println("      thing to fix: right-click setup-lan.bat -> Run as administrator.")
+}
+
+func reportFirewall(w io.Writer, cfg config.Config) {
+	port := cfg.ListenPort
 	out, err := exec.Command("netsh", "advfirewall", "firewall", "show",
 		"rule", "name=Gemma4-Web").CombinedOutput()
+	rule := false
 	switch {
 	case err != nil && len(out) == 0:
 		fmt.Fprintf(w, "  firewall:    could not run netsh: %v\n", err)
-	case !strings.Contains(string(out), strconv.Itoa(port)):
-		fmt.Fprintln(w, "  firewall:    NO RULE for this port.")
+	case !portMentioned(string(out), port):
+		fmt.Fprintln(w, "  firewall:    no Gemma4-Web rule for this port.")
 		fmt.Fprintln(w, "               Either setup-lan.bat was never run, or it ran before")
 		fmt.Fprintln(w, "               the port was settled and opened a different one. Re-run")
 		fmt.Fprintln(w, "               it as Administrator now that listen_port is known:")
 		fmt.Fprintln(w, "                 right-click setup-lan.bat -> Run as administrator")
+		if all, ok := inboundRules(); ok && firewallMentionsUs(all, port) {
+			fmt.Fprintln(w, "               Something else does mention GobboNet or this port,")
+			fmt.Fprintln(w, "               though -- Windows writes its own rule, named after the")
+			fmt.Fprintln(w, "               executable, when the \"Allow access?\" prompt is answered.")
+			fmt.Fprintln(w, "               That may already be granting access:")
+			fmt.Fprintln(w, "                 netsh advfirewall firewall show rule name=all dir=in | findstr /i gobbonet")
+		}
 	default:
+		rule = true
 		fmt.Fprintf(w, "  firewall:    rule Gemma4-Web present for port %d\n", port)
 		// Present is not sufficient. The rule is scoped to LocalSubnet, which
 		// is computed per-interface, so a phone on a mesh node or guest SSID
@@ -371,6 +574,18 @@ func reportFirewall(w io.Writer, port int) {
 		fmt.Fprintln(w, "               Scoped to LocalSubnet. A phone on a guest network, a")
 		fmt.Fprintln(w, "               mesh node with its own DHCP scope, or a different band")
 		fmt.Fprintln(w, "               on a split-SSID router is off-subnet and still blocked.")
+	}
+
+	// LAN takes two things, and each half reports itself as healthy while the
+	// other is missing. This is the only line that looks at both. Measured with
+	// a rule present and the socket on 127.0.0.1: the phone cannot connect and
+	// reports a timeout, with nothing on the machine explaining it.
+	if rule && isLoopbackConfigured(cfg.ListenHost) {
+		fmt.Fprintln(w, "  [!] MISMATCH: the firewall is open and the server is not listening")
+		fmt.Fprintln(w, "               on the network, so a phone cannot connect and nothing")
+		fmt.Fprintln(w, "               else on this machine will say why. Fix:")
+		fmt.Fprintln(w, "                 gobbonet config set listen_host 0.0.0.0")
+		fmt.Fprintln(w, "               then restart GobboNet.")
 	}
 
 	blocks, err := exec.Command("netsh", "advfirewall", "firewall", "show",
@@ -503,6 +718,13 @@ func firewalldAllowsPort(list string, port int) bool {
 // FIELD LABELS but not the values, so the parse keys on the values: the program
 // path, and the English-invariant "Block" action keyword. Split out from
 // reportFirewall so it can be tested without netsh.
+// ⚠ Locale: "block" is the translated Action *value*. This works on English and,
+// by luck, on German ("Blockieren" contains it) -- and misses French "Bloquer",
+// Spanish "Bloquear", Italian "Blocca" and every non-Latin locale. There, a
+// Block rule pair goes uncounted and the caller stays quiet about a genuinely
+// blocked install. Fixing it properly means reading the rules untranslated from
+// HKLM\SYSTEM\CurrentControlSet\Services\SharedAccess\Parameters\FirewallPolicy\
+// FirewallRules, where Action, Dir, LPort and App are fixed tokens.
 func countBlockedGobbonetRules(out string) int {
 	n := 0
 	for _, stanza := range strings.Split(strings.ReplaceAll(out, "\r\n", "\n"), "\n\n") {

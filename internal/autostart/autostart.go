@@ -17,6 +17,7 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"runtime"
 	"strings"
 )
 
@@ -113,7 +114,16 @@ func Disable() error {
 }
 
 // Set applies a boolean, which is what the wizard's checkbox needs.
+// Supported reports whether this platform has an implementation. The entry is
+// an XDG .desktop file, which Windows never reads, so offering it there would
+// promise a login start that silently never happens.
+func Supported() bool { return runtime.GOOS != "windows" }
+
 func Set(on bool) error {
+	if !Supported() {
+		return nil
+	}
+
 	if on {
 		return Enable()
 	}

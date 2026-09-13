@@ -1,3 +1,10 @@
+# Go migration inventory
+
+> ⚠ **A design note from the Go migration, not a description of this fork.** It
+> inventories what the Go server had to take over from the PowerShell path. That
+> migration is complete here — `launch.bat` and `fileserver.ps1` are deleted — so
+> the "still in PowerShell" columns record where things stood, not where they are.
+
 ## Complete API Endpoint Inventory
 
 ### 1. Authentication (both implementations)

@@ -1,9 +1,10 @@
 // Command gobbonet serves the chat UI, proxies to llama.cpp, and — in local
 // mode — supervises the llama-server process.
 //
-// This replaces launch.bat's runtime half. The setup half (hardware probe, model
-// download) stays in the launcher scripts for now; those are one-time
-// interactive flows, not drift-prone hot paths.
+// This replaces launch.bat entirely on Windows, which this fork deletes. Of the
+// setup half, only the hardware probe is still a script; the password, backend,
+// model and retrieval-model choices are the web wizard in internal/setup, which
+// is what the Linux packages already used.
 //
 //	gobbonet                          serve using the discovered config
 //	gobbonet serve --config PATH      serve using a specific config
@@ -23,6 +24,7 @@ import (
 	"os"
 	"os/signal"
 	"path/filepath"
+	"runtime"
 	"strings"
 	"syscall"
 	"time"
@@ -151,6 +153,8 @@ func run(argv []string) error {
 		return cmdAutostart(argv)
 	case "check":
 		return cmdCheck(argv)
+	case "fetch-embeddings":
+		return cmdFetchEmbeddings(argv)
 	case "doctor":
 		return cmdDoctor(argv)
 	case "config":
@@ -178,6 +182,7 @@ func usage() {
   gobbonet uninstall [--keep-models] [--remove-models] [--yes]
   gobbonet check [--config PATH]
   gobbonet doctor [--config PATH]
+  gobbonet fetch-embeddings [--config PATH] [--force]
   gobbonet config get [--config PATH] <key>
   gobbonet config set [--config PATH] <key> <value>
   gobbonet config keys
@@ -216,6 +221,19 @@ func stringFlag(fs *flag.FlagSet, name, usage string) *string {
 
 // --- serve -----------------------------------------------------------------
 
+// canRunWizard reports whether there is anyone to run it for. Without this a
+// systemd unit or container running bare gobbonet with no password would block
+// forever on a loopback URL nobody can open, where it used to fail fast.
+func canRunWizard() bool {
+	if runtime.GOOS == "windows" {
+		return true
+	}
+	if term.IsTerminal(int(os.Stdin.Fd())) {
+		return true
+	}
+	return os.Getenv("DISPLAY") != "" || os.Getenv("WAYLAND_DISPLAY") != ""
+}
+
 func cmdServe(argv []string) error {
 	fs := flag.NewFlagSet("gobbonet serve", flag.ContinueOnError)
 	configPath := stringFlag(fs, "config", "path to config.toml")
@@ -250,6 +268,36 @@ func cmdServe(argv []string) error {
 	if err != nil {
 		return err
 	}
+
+	// Bare `gobbonet` is the only spelling that can be right on a first run, a
+	// normal run and an upgrade alike, because a Windows shortcut cannot branch.
+	// An unset access_secret is the extra condition: the marker is absent on any
+	// install configured by hand with `config set` + `set-password`, and those
+	// must keep serving rather than being sent back through the wizard.
+	// Three ways in: setup never ran; a wizard was abandoned after the password;
+	// or it finished in local mode with no chat model, which is complete but
+	// cannot chat and has no other route to fix itself.
+	firstRun := !setup.Complete(cfg.DataDir) &&
+		(cfg.AccessSecret == "" || setup.Started(cfg.DataDir))
+	// A local install with no chat model cannot chat, and nothing but the wizard
+	// offers one. Offer it -- unless the user already turned that offer down,
+	// which is the only thing that would make repeating it pestering. That
+	// refusal is forgotten as soon as a model exists again, so removing the
+	// models later brings the offer back.
+	haveModel := len(config.GGUFsIn(cfg.ModelDir)) > 0
+	if haveModel {
+		setup.ClearModelDeclined(cfg.DataDir)
+	}
+	modelGone := cfg.ServerExe != "" && !haveModel && !setup.ModelDeclined(cfg.DataDir)
+	if !*noAuth && (firstRun || modelGone) && canRunWizard() {
+		if err := firstRunSetup(cfg.Path, modelGone); err != nil {
+			return err
+		}
+		if cfg, err = loadConfig(cfg.Path); err != nil {
+			return err
+		}
+	}
+
 	if err := cfg.Runnable(); err != nil {
 		return err
 	}
@@ -348,6 +396,30 @@ func cmdServe(argv []string) error {
 	}
 	defer srv.Shutdown()
 
+	// Started in both modes on purpose. Remote mode means somebody else runs the
+	// chat engine, not that retrieval stops mattering, and the bundled engine is
+	// sitting right here either way.
+	var emb *supervisor.Embedder
+	if cfg.EmbedEnable {
+		exe := cfg.EmbedExe
+		if exe == "" {
+			exe = cfg.ServerExe
+		}
+		if exe == "" {
+			exe = config.DiscoverServerExe()
+		}
+		emb = supervisor.NewEmbedder(supervisor.EmbedOptions{
+			Exe:     exe,
+			Model:   cfg.EmbedModelPath(),
+			URL:     cfg.EmbedURL,
+			LogFile: filepath.Join(cfg.DataDir, "embed-server.log"),
+		})
+		if err := emb.Start(); err != nil {
+			fmt.Printf(" [!]  embeddings: %v\n", err)
+		}
+		defer emb.Stop()
+	}
+
 	fmt.Printf(" [OK] mode: %s\n", mode)
 	fmt.Printf(" [OK] llama.cpp upstream: %s\n", cfg.LLMURL)
 	fmt.Printf(" [OK] config: %s\n", cfg.Path)
@@ -389,7 +461,7 @@ func cmdServe(argv []string) error {
 	srv.SetBind(bind)
 
 	// Record the port we actually bound, beside this binary, where
-	// setup-lan.bat and launch.bat already look for it (%~dp0.gobbonet-port).
+	// setup-lan.bat already looks for it (%~dp0.gobbonet-port).
 	//
 	// Written AFTER the bind succeeds, so the file always describes a port that
 	// really was served rather than one we hoped for. Nothing used to write it,
@@ -398,9 +470,9 @@ func cmdServe(argv []string) error {
 	// 503 on the address the user was told to visit, from HTTP.SYS answering
 	// for an empty reservation, while the server runs fine elsewhere.
 	//
-	// Windows only. The sidecar's only readers are setup-lan.bat and
-	// launch.bat, so WritePortFile is a no-op everywhere else and returns nil
-	// — there is nothing to warn about on a platform that has no reader.
+	// Windows only. setup-lan.bat is the sidecar's one remaining reader, so
+	// WritePortFile is a no-op everywhere else and returns nil — there is
+	// nothing to warn about on a platform that has no reader.
 	//
 	// It used to attempt the write regardless, and on Linux the binary sits in
 	// root-owned /usr/lib/gobbonet, so every launch by every normal user
@@ -464,6 +536,7 @@ func cmdServe(argv []string) error {
 				fmt.Println("      that works.")
 			}
 		}
+		warnIfFirewallClosed(bind.Port)
 	} else {
 		// Loopback because the config asked for it. Not a warning.
 		fmt.Printf(" [OK] serving on http://%s:%d/  (this machine only)\n", bind.Host, bind.Port)
@@ -500,6 +573,7 @@ func cmdServe(argv []string) error {
 		<-stop
 		fmt.Println("\n [..] shutting down")
 		srv.Shutdown()
+		emb.Stop()
 		os.Exit(0)
 	}()
 
@@ -558,7 +632,7 @@ func lanBindHelp(cfg config.Config) []string {
 // event: something already held the port. Usually it is a gobbonet from an
 // earlier run — closing a terminal window does not always stop it, and a reboot
 // clears it, which is why rebooting appears to fix a configuration that was
-// never wrong. launch.bat learned to say this in 1.6.0 (and names the holding
+// never wrong. The batch path learned to say this in 1.6.0 (and named the holding
 // PID, which needs Get-NetTCPConnection and has no portable equivalent here).
 //
 // Anything that is not an in-use error is returned unchanged: inventing an

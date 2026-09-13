@@ -157,3 +157,61 @@ func TestFirewalldAllowsPort(t *testing.T) {
 		t.Error("empty list reported as open")
 	}
 }
+
+// A substring match reported a rule for 9066 as covering 906, 66 and 6.
+func TestPortMentionedMatchesWholeNumbersOnly(t *testing.T) {
+	const out = "Rule Name: Gemma4-Web\nLocalPort: 9066\nRemoteIP: LocalSubnet\n"
+	for _, port := range []int{9066} {
+		if !portMentioned(out, port) {
+			t.Errorf("port %d: not found in the rule that names it", port)
+		}
+	}
+	for _, port := range []int{906, 66, 6, 4, 90, 19066, 90660} {
+		if portMentioned(out, port) {
+			t.Errorf("port %d: matched a rule for 9066", port)
+		}
+	}
+}
+
+// The real machine that broke the old check: setup-lan.bat's rules removed,
+// Windows' own rules present under the executable's name, phone connecting.
+func TestFirewallMentionsUsSeesWindowsOwnRules(t *testing.T) {
+	const windowsWrote = "Rule Name:  gobbonet.exe\n\nRule Name:  gobbonet.exe\n"
+	if !firewallMentionsUs(windowsWrote, 9066) {
+		t.Error("rules named gobbonet.exe were not recognised")
+	}
+	const setupLan = "Rule Name: Gemma4-Web\nLocalPort: 9066\n"
+	if !firewallMentionsUs(setupLan, 9066) {
+		t.Error("setup-lan.bat's port rule was not recognised")
+	}
+	const unrelated = "Rule Name: Remote Desktop\nLocalPort: 3389\n"
+	if firewallMentionsUs(unrelated, 9066) {
+		t.Error("an unrelated rule was taken for ours")
+	}
+	// Locale: netsh translates Allow/Enabled, so nothing may read them.
+	const german = "Regelname: gobbonet.exe\nAktiviert: Ja\n"
+	if !firewallMentionsUs(german, 9066) {
+		t.Error("a translated listing was not recognised")
+	}
+}
+
+// Documents where the block scan stops working rather than asserting it does.
+// "block" is the translated Action value: English and German carry it, French
+// and Spanish do not, so those machines get no warning about a blocked install.
+func TestBlockedRuleCountIsNotLocaleProof(t *testing.T) {
+	for _, tc := range []struct {
+		lang, stanza string
+		want         int
+	}{
+		{"en", "Rule Name: gobbonet.exe\nAction: Block\n", 1},
+		{"de", "Regelname: gobbonet.exe\nAktion: Blockieren\n", 1},
+		{"fr", "Nom de la règle: gobbonet.exe\nAction: Bloquer\n", 0},
+		{"es", "Nombre de regla: gobbonet.exe\nAcción: Bloquear\n", 0},
+	} {
+		if got := countBlockedGobbonetRules(tc.stanza); got != tc.want {
+			t.Errorf("%s: counted %d, expected %d -- if this now finds the French and "+
+				"Spanish cases, the locale gap is closed and the comment should go",
+				tc.lang, got, tc.want)
+		}
+	}
+}

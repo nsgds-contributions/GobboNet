@@ -11,8 +11,9 @@ nothing can clear.
 | Location | What is there | Cleared by |
 |---|---|---|
 | Browser storage on this PC | every thread, character, persona, macro, plus cached embeddings and retrieval telemetry | **Data → PURGE ALL** in the app |
-| `.gobbonet-state.json` in the install folder | a mirror of the above, so a reload never loses a thread | uninstalling |
-| `.jobs\` in the install folder | in-flight generation spool | uninstalling |
+| `state.json` in the **data** folder | a mirror of the above, so a reload never loses a thread | `gobbonet uninstall` |
+| `.jobs\` in the **data** folder | generation spool; the Go server keeps jobs in memory and only sweeps this | `gobbonet uninstall` |
+| `.gobbonet-state.json`, `.gobbonet-secret`, `.jobs\` in the **install** folder | an older GobboNet's transcripts, password hash and spool — the batch path kept them here | the uninstaller, from this version on |
 | Browser storage on a **phone or tablet** that connected | a full copy, held by that device | only that device |
 
 The important one: **browser storage is keyed to the exact address you
@@ -38,25 +39,56 @@ blocks deletion.
 > place, so history could reappear on reload. If you purged on an earlier
 > version, purge again on 1.5.9 or clear site data as below.
 
-PURGE ALL clears **this browser only**. It does not touch the server-side
-mirror or any other device.
+PURGE ALL also clears the server-side mirror, in the normal case: it saves state
+when it finishes, and that schedules a sync which overwrites the mirror with the
+emptied state a couple of seconds later.
+
+⚠ **Wait for the sync indicator to confirm, then reload, and only then trust
+it.** If that push does not land — the server was down, the PUT failed, or you
+closed the tab too quickly — the next reload sees empty local storage next to a
+server that still has data, and **restores everything silently, with no prompt**.
+That is the right behaviour for a new device and the wrong one here. If the
+indicator never confirms, do step 2 by hand.
+
+It clears **this browser only** in the sense that matters for other devices: a
+phone that connected keeps its own copy until you clear it there.
 
 ### 2. The server-side mirror
 
-Uninstalling removes `.gobbonet-state.json` and the job spool. If you are
-not uninstalling and want it gone now, stop GobboNet and delete it:
+⚠ **These do not live in the install folder**, so deleting that folder, or
+running the Windows uninstaller and leaving the settings box unticked, leaves
+them behind. They are in the data folder, which is separate on purpose: a
+reinstall is meant to keep your conversations.
+
+`gobbonet uninstall` is the command that clears them, and the Windows
+uninstaller's **settings** checkbox is what calls it. To do it by hand instead,
+stop GobboNet and delete:
 
 ```powershell
-Remove-Item "$env:LOCALAPPDATA\GobboNet\.gobbonet-state.json" -Force
-Remove-Item "$env:LOCALAPPDATA\GobboNet\.jobs" -Recurse -Force
+Remove-Item "$env:USERPROFILE\.local\share\gobbonet\state.json" -Force
+Remove-Item "$env:USERPROFILE\.local\share\gobbonet\.jobs" -Recurse -Force
 ```
 
-Adjust the path if you installed elsewhere. To find every copy on the
-machine, including old test installs:
+`gobbonet doctor` prints the real data folder under **CONFIG** if you moved it.
+To find every copy on the machine, including old test installs:
 
 ```powershell
-Get-ChildItem $env:USERPROFILE -Recurse -Force -Filter ".gobbonet-state.json" `
-  -ErrorAction SilentlyContinue | Select-Object FullName, Length, LastWriteTime
+Get-ChildItem $env:USERPROFILE -Recurse -Force -ErrorAction SilentlyContinue `
+  -Include "state.json", ".gobbonet-state.json", ".gobbonet-secret", ".jobs" |
+  Where-Object FullName -like "*obbo*" |
+  Select-Object FullName, Length, LastWriteTime
+```
+
+⚠ **If you upgraded from a version that used `launch.bat`,** look in the install
+folder too — the default below, or wherever you unpacked `launch.bat` if you
+used a zip rather than the installer. That path kept the state mirror, the spool and the password hash
+there, nothing since has read them, and until this version no uninstaller
+removed them — so they can outlive an uninstall:
+
+```powershell
+Remove-Item "$env:LOCALAPPDATA\GobboNet\.gobbonet-state.json" -Force -ErrorAction SilentlyContinue
+Remove-Item "$env:LOCALAPPDATA\GobboNet\.gobbonet-secret"     -Force -ErrorAction SilentlyContinue
+Remove-Item "$env:LOCALAPPDATA\GobboNet\.jobs" -Recurse -Force -ErrorAction SilentlyContinue
 ```
 
 ### 3. Browser storage, the thorough way
@@ -113,7 +145,13 @@ on disk:
 
 ```powershell
 Get-ChildItem "$env:LOCALAPPDATA\GobboNet" -Force |
-  Where-Object { $_.Name -like ".gobbonet*" -or $_.Name -like "*.log" }
+  Where-Object { $_.Name -like ".gobbonet*" -or $_.Name -like "*.log" -or $_.Name -eq ".jobs" }
+Get-ChildItem "$env:USERPROFILE\.local\share\gobbonet" -Force -ErrorAction SilentlyContinue
 ```
 
-An empty result means the install folder holds no conversation data.
+Two folders, because conversations live in the second one. The first is the
+install folder and only holds anything if you upgraded from a `launch.bat`
+version — the `.jobs` term is there because the old filter matched only files
+and would have shown that directory's name but never flagged it.
+
+An empty result from both means no conversation data is left on disk.

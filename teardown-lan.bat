@@ -127,6 +127,29 @@ call :drop_rule "Gemma4-mDNS"
 call :drop_rule "GobboNet"
 call :drop_rule "Gemma4-LLM"
 call :drop_rule "Gemma4-Search"
+
+:: Rules Windows wrote itself. When gobbonet.exe first binds a network port,
+:: Windows shows "Allow access?" and writes its own inbound rules -- named after
+:: the executable, not after anything this script created. Answering that prompt
+:: is how most machines end up reachable, because the install is deliberately
+:: non-admin and setup-lan.bat is opt-in. Deleting only the names above left
+:: those in place, so "remove the LAN rules" removed some of them and the phone
+:: kept connecting. Matching on the program path catches them whatever they are
+:: called, and takes any Block rules for the same binary with them.
+echo  [..] Removing rules Windows added for gobbonet.exe...
+netsh advfirewall firewall show rule name=all dir=in verbose 2>nul | findstr /i /c:"%~dp0gobbonet.exe" >nul 2>&1
+if errorlevel 1 (
+    echo  [--] No rules found for gobbonet.exe
+) else (
+    netsh advfirewall firewall delete rule name=all program="%~dp0gobbonet.exe" >nul 2>&1
+    netsh advfirewall firewall show rule name=all dir=in verbose 2>nul | findstr /i /c:"%~dp0gobbonet.exe" >nul 2>&1
+    if errorlevel 1 (
+        echo  [OK] Removed the rules Windows added for gobbonet.exe
+    ) else (
+        echo  [ERROR] Could not remove them. Run this by hand as Administrator:
+        echo            netsh advfirewall firewall delete rule name=all program="%~dp0gobbonet.exe"
+    )
+)
 echo.
 
 :: ---------------------------------------------------------------

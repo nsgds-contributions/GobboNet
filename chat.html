@@ -196,8 +196,8 @@
         </div>
         <div class="form-group">
           <label for="perf-gpu">GPU layers</label>
-          <input type="number" id="perf-gpu" min="0" max="999" step="1">
-          <div class="form-hint">99 means all of them. Lower pushes work onto the CPU: slower, but frees VRAM. 0 is CPU only.</div>
+          <input type="number" id="perf-gpu" min="-1" max="999" step="1">
+          <div class="form-hint">-1 lets llama.cpp fit the offload to your card, and is the default. 99 forces all of them. Lower pushes work onto the CPU: slower, but frees VRAM. 0 is CPU only.</div>
         </div>
       </div>
 
