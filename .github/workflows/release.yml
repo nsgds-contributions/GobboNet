@@ -1,0 +1,261 @@
+# Builds every release artifact and attests where each one came from.
+#
+# The point of this file is that nothing reaches a Releases page by hand. A user
+# who downloads GobboNetSetup.exe can run
+#
+#   gh attestation verify GobboNetSetup-*.exe --repo <owner>/GobboNet
+#
+# and get back the workflow, the commit and the runner that produced it. That is
+# the question an unsigned installer cannot otherwise answer.
+#
+# Third-party actions are pinned to a commit, never a tag: a tag can be moved.
+# Permissions are declared per job rather than at the top, so only the job that
+# publishes can write, and only the job that attests holds an OIDC token.
+
+name: release
+
+on:
+  push:
+    tags: ["v*"]
+  workflow_dispatch:
+    inputs:
+      dry_run:
+        description: "Build and attest, but publish nothing"
+        type: boolean
+        default: true
+
+permissions: {}
+
+env:
+  # Bumping this means bumping installer-linux/engine.sha256 in the same commit.
+  LLAMA_BUILD: b10456
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5
+        with:
+          persist-credentials: false
+      - uses: actions/setup-go@924ae3a1cded613372ab5595356fb5720e22ba16 # v6
+        with:
+          go-version-file: go.mod
+          cache: false
+      # build-release.sh pins GOTOOLCHAIN itself and aborts if the switch did not
+      # happen, so the toolchain is the script's business, not the runner's.
+      - run: ./build-release.sh
+      - id: v
+        run: echo "version=$(basename "$(ls -d dist/*/)")" >> "$GITHUB_OUTPUT"
+      - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7
+        with:
+          name: dist
+          path: dist/
+          retention-days: 7
+    outputs:
+      version: ${{ steps.v.outputs.version }}
+
+  # Same source, second clean runner. Go is reproducible given a fixed toolchain,
+  # -trimpath and CGO_ENABLED=0, so a mismatch means one of those slipped -- which
+  # is exactly the claim the attestation would otherwise be making on trust.
+  verify-repro:
+    needs: build
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5
+        with:
+          persist-credentials: false
+      - uses: actions/setup-go@924ae3a1cded613372ab5595356fb5720e22ba16 # v6
+        with:
+          go-version-file: go.mod
+          cache: false
+      - run: ./build-release.sh
+      - uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8
+        with:
+          name: dist
+          path: first/
+      - name: Compare the two builds
+        run: |
+          set -eu
+          d="${{ needs.build.outputs.version }}"
+          # Compare CONTENTS, not archives. tar and zip both record mtimes, so
+          # two runs never produce identical archives however deterministic the
+          # compiler was -- the first version of this job compared the wrappers
+          # and failed on every file. What is actually claimed reproducible is
+          # what comes out of them.
+          extract() {
+            mkdir -p "$2"
+            for f in "$1"/*.tar.gz; do [ -e "$f" ] && tar xzf "$f" -C "$2"; done
+            for f in "$1"/*.zip; do [ -e "$f" ] && unzip -qo "$f" -d "$2"; done
+            (cd "$2" && find . -type f -exec sha256sum {} + | sort -k2)
+          }
+          extract "dist/$d" a > a.sums
+          extract "first/$d" b > b.sums
+          if diff -u a.sums b.sums; then
+            echo "$(wc -l < a.sums) files reproduced byte-for-byte across two clean runners"
+          else
+            echo "::error::the two builds disagree; see the diff above"
+            exit 1
+          fi
+
+  installer-win:
+    needs: build
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5
+        with:
+          persist-credentials: false
+      - uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8
+        with:
+          name: dist
+          path: dist/
+      - name: Install makensis
+        run: sudo apt-get update -qq && sudo apt-get install -y -qq nsis
+      # The engine is fetched, not vendored, so this is the one place a silent
+      # substitution could enter the installer. Verify before unzipping, and fail
+      # loudly: a re-uploaded asset must stop the build, not ship.
+      - name: Fetch and verify llama.cpp
+        run: |
+          set -eu
+          asset="llama-${LLAMA_BUILD}-bin-win-vulkan-x64.zip"
+          url="https://github.com/ggml-org/llama.cpp/releases/download/${LLAMA_BUILD}/${asset}"
+          curl -fsSL --retry 3 -o engine.zip "$url"
+          want="$(grep '^WIN_GPU_SHA256=' installer-linux/engine.sha256 | cut -d= -f2)"
+          got="$(sha256sum engine.zip | cut -d' ' -f1)"
+          if [ "$want" != "$got" ]; then
+            echo "::error::engine hash mismatch for $asset"
+            echo "  pinned in installer-linux/engine.sha256: $want"
+            echo "  downloaded:                              $got"
+            exit 1
+          fi
+          echo "engine verified against the pin: $got"
+          mkdir -p installer/vendor/llama-cpp
+          unzip -q engine.zip -d installer/vendor/llama-cpp
+      - name: Build the installer
+        run: |
+          set -eu
+          # build-release.sh removes its staging directories, so the artifact
+          # holds archives only -- the binary has to come back out of the zip.
+          zip="$(find dist -name '*-windows-amd64.zip' -print -quit)"
+          [ -n "$zip" ] || { echo "::error::no windows archive in the build artifact"; exit 1; }
+          # Unpack outside the checkout. build-installer.sh stamps -dirty from
+          # `git status --porcelain`, and an untracked directory in the worktree
+          # is enough to trigger it -- the first run shipped
+          # GobboNetSetup-...-dirty.exe from nothing but this extraction, which
+          # would have told users the build did not match its own commit.
+          unzip -qo "$zip" -d "$RUNNER_TEMP/win"
+          exe="$(find "$RUNNER_TEMP/win" -name gobbonet.exe -print -quit)"
+          [ -n "$exe" ] || { echo "::error::no gobbonet.exe inside $zip"; exit 1; }
+          if [ -n "$(git status --porcelain)" ]; then
+            echo "::error::the checkout is dirty, so the installer would be stamped -dirty"
+            git status --porcelain
+            exit 1
+          fi
+          cd installer && GOBBONET_EXE="$exe" ./build-installer.sh
+      - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7
+        with:
+          name: installer
+          path: installer/GobboNetSetup-*.exe
+          retention-days: 7
+
+  # Attesting is separate from publishing so that a dry run does not ask anyone
+  # for anything. Environment approval is requested when a job STARTS, not when
+  # it publishes -- so while these were one job, every dry run raised a review
+  # prompt for a run whose publish step was skipped anyway. An approval that
+  # arrives on runs which cannot publish is one people learn to click.
+  attest:
+    needs: [build, verify-repro, installer-win]
+    runs-on: ubuntu-latest
+    permissions:
+      id-token: write       # OIDC identity for Sigstore
+      attestations: write   # store the provenance bundles
+    steps:
+      - uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8
+        with:
+          name: installer
+          path: out/
+      # Only the installer is published. The five portable archives are still
+      # built and still compared across two runners, because that is what proves
+      # the compiler is deterministic -- but a release page offering six ways to
+      # get the same program mostly offers six ways to pick the wrong one.
+      - name: Collect the assets
+        run: |
+          set -eu
+          cd out && sha256sum GobboNetSetup-*.exe > SHA256SUMS && cat SHA256SUMS
+      # Attest before publishing. An asset that reaches the page without a bundle
+      # is the failure this workflow exists to prevent, so ordering matters --
+      # and the publish job below cannot start until this one has succeeded.
+      - uses: actions/attest-build-provenance@977bb373ede98d70efdf65b84cb5f73e068dcc2a # v3
+        with:
+          subject-path: "out/*.exe"
+      - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7
+        with:
+          name: release-assets
+          path: out/
+          retention-days: 7
+      - name: Say what would have been published
+        if: github.ref_type != 'tag'
+        run: |
+          echo "### Nothing published — assets built and attested only" >> "$GITHUB_STEP_SUMMARY"
+          echo "Publishing needs a \`v*\` tag; this ran on \`${GITHUB_REF_NAME}\`." >> "$GITHUB_STEP_SUMMARY"
+
+  publish:
+    needs: attest
+    runs-on: ubuntu-latest
+    # Skipped entirely on anything that is not a tag, so the environment is
+    # never consulted and no reviewer is disturbed. A request to approve means
+    # exactly one thing: a release is about to be published.
+    if: >-
+      github.ref_type == 'tag' &&
+      (github.event_name == 'push' ||
+       (github.event_name == 'workflow_dispatch' && inputs.dry_run == false))
+    environment: release
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8
+        with:
+          name: release-assets
+          path: out/
+      # Gated on ref_type before anything else. On a workflow_dispatch the ref is
+      # whatever was selected -- normally the branch -- so the naive
+      # "not a dry run" test would `gh release create main`, producing a release
+      # and a git tag both called "main" beside the branch of that name.
+      #
+      # The event_name half is spelled out rather than left as `inputs.dry_run ==
+      # false` because that comparison is TRUE when there are no inputs at all:
+      # the expression language coerces null and false alike to 0. Harmless with today's
+      # two triggers, and a live grenade for the scheduled pin-check this
+      # workstream still wants to add to this file.
+      - name: Publish
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -eu
+          tag="${GITHUB_REF_NAME}"
+          # A file rather than an inline argument: the notes are markdown with
+          # blank lines, which do not survive a YAML block scalar intact.
+          cat > notes.md <<NOTES
+          Built by \`.github/workflows/release.yml\` from \`${GITHUB_SHA}\`.
+
+          Verify any asset:
+
+              gh attestation verify <file> --repo ${GITHUB_REPOSITORY}
+
+          That reports the workflow, the commit and the runner that produced it.
+          \`SHA256SUMS\` covers the same files.
+
+          The installer is **unsigned**. Provenance is not a code-signing
+          certificate, and SmartScreen keys on the latter.
+          NOTES
+          gh release create "$tag" out/* \
+            --repo "$GITHUB_REPOSITORY" \
+            --title "$tag" \
+            --notes-file notes.md
+          echo "Assets built and attested:" >> "$GITHUB_STEP_SUMMARY"
+          ls out/ | sed 's/^/- /' >> "$GITHUB_STEP_SUMMARY"
