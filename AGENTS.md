@@ -1,20 +1,31 @@
 # Gobbonet — Developer Guide
 
-> A self-hosted, offline AI chat frontend for local GGUF models, running entirely on Windows via PowerShell + batch scripts. No build step, no external dependencies, no accounts.
+> A self-hosted, offline AI chat frontend for local GGUF models. No accounts, no
+> telemetry, and nothing leaves the machine except an optional web search.
+
+⚠ **This fork runs the Go server on every platform.** `fileserver.ps1` and
+`launch.bat` are still in the tree, unchanged from upstream so that merges stay
+clean, but nothing this fork builds ships them. The sections below describing
+them are upstream's Windows path, not this fork's — kept because the Go code is
+a port of them and the reasoning still explains why it behaves as it does. For
+the runtime, read [`docs/GO_SERVER.md`](docs/GO_SERVER.md); for the Windows installer,
+[`installer/README.md`](installer/README.md).
 
 ---
 
 ## Quick start for developers
 
-```bash
-# The project root is the only directory that matters
-# All files run as-is — no npm, no bundler, no transpiler
-
-# To run:
-.\launch.bat              # Start the full app
-.\setup-lan.bat           # One-time: open firewall for phone access
-.\fileserver.ps1          # Manual server start (rarely needed — launch.bat handles this)
+```sh
+./stage-web.sh                        # stage chat.html + js/ + css/ into internal/webui/assets
+go build -o gobbonet ./cmd/gobbonet   # the server, with that page compiled in; Go 1.25, no cgo
+./gobbonet                            # serve, or run the setup wizard on a first run
+./gobbonet doctor                     # paths, ports, GPU devices, firewall
 ```
+
+The frontend has no build step of its own — no npm, no bundler, no transpiler — but it is
+compiled into the binary. An unstamped build is version `dev`: on first run it writes the
+page to `web/` beside itself and serves that copy, and later `dev` builds keep it. After
+editing, either edit `web/` and reload, or re-run `stage-web.sh`, rebuild and delete `web/`.
 
 ---
 
@@ -132,6 +143,9 @@ stylesheets; globals are shared across modules, so **load order is load-bearing*
 
 ### `fileserver.ps1` — Web server + proxy (2,055 lines)
 
+⚠ **Not shipped by this fork** (still in the tree, unchanged from upstream). Ported to `internal/server` and `internal/proxy`; kept as background.
+
+
 PowerShell using `System.Net.HttpListener` — no external runtime needed.
 
 - **Static file serving** — Serves `chat.html`, `style.css`, model metadata files
@@ -153,6 +167,9 @@ then 9066. The Go server uses the same numbers but takes them from
 `config.toml` — see `GO_SERVER.md`.
 
 ### `launch.bat` — Orchestrator (2,428 lines)
+
+⚠ **Not shipped by this fork** (still in the tree, unchanged from upstream). Its runtime half is `internal/supervisor`, its setup half `internal/setup` and `installer/`.
+
 
 Windows batch script — the entry point for end users and the coordination layer for dev work.
 
@@ -306,12 +323,18 @@ directly; point it at your own relay to interpose one.
 
 ### PowerShell conventions in `fileserver.ps1`
 
+⚠ **Not shipped by this fork.**
+
+
 - **ASCII-only output** — launcher routes output through batch `echo`, which mangles non-ASCII
 - **Env vars via `Get-EnvOrDefault()`** — all configuration comes from launch.bat
 - **`HttpListener`** — no external libraries, uses .NET built-in HTTP listener
 - **Sentinel files** — `.swap-in-progress` coordinates with launch.bat's health monitor
 
 ### Batch conventions in `launch.bat`
+
+⚠ **Not shipped by this fork.**
+
 
 - **Keep-open guard** — relaunches via `cmd /k` to prevent window from vanishing on error
 - **`setlocal EnableDelayedExpansion`** — needed for `!variable!` syntax in loops
@@ -372,6 +395,10 @@ Open browser DevTools → Application → Local Storage → `gobbonet-state` to 
 - Server console — PowerShell fileserver output
 
 ### Recovery
+⚠ The password line below is upstream's batch path, not shipped by this fork. Here the password is
+`access_secret` in `config.toml`: use `gobbonet set-password`, or `gobbonet keyring recover` on an
+encrypted install.
+
 - **Lost chats**: The app shows a restore prompt if state migration fails
 - **Forgot password**: Run `launch.bat reset-password` or delete `.gobbonet-secret`
 - **Corrupt state**: Export → Purge all → Import backup

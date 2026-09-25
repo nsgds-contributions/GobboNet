@@ -283,19 +283,26 @@ func (d *Download) Run() {
 		}
 	}
 
-	// Backstop for the skipped-hash case. HuggingFace serves an LFS pointer of
-	// a few hundred bytes instead of the model when something goes wrong
-	// upstream, and it arrives as a clean 200.
-	floor := int64(SizeFloor)
-	if d.sizeFloor > 0 {
-		floor = d.sizeFloor
-	}
-	if written < floor {
-		os.Remove(part)
-		d.fail(fmt.Sprintf(
-			"The download is only %.1f MB, which usually means an error page arrived "+
-				"instead of the model. Nothing was kept.", float64(written)/(1<<20)))
-		return
+	// Backstop for the skipped-hash case, and only that case. HuggingFace serves
+	// an LFS pointer of a few hundred bytes instead of the model when something
+	// goes wrong upstream, and it arrives as a clean 200.
+	//
+	// A verified checksum already proves the bytes, and this floor is a whole
+	// gigabyte because it was written for chat models. Applying it anyway
+	// deletes any smaller model that passed verification -- the 146 MB
+	// retrieval model among them.
+	if want == "" {
+		floor := int64(SizeFloor)
+		if d.sizeFloor > 0 {
+			floor = d.sizeFloor
+		}
+		if written < floor {
+			os.Remove(part)
+			d.fail(fmt.Sprintf(
+				"The download is only %.1f MB, which usually means an error page arrived "+
+					"instead of the model. Nothing was kept.", float64(written)/(1<<20)))
+			return
+		}
 	}
 
 	if err := os.Rename(part, final); err != nil {

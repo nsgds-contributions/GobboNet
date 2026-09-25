@@ -23,12 +23,14 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"mime"
 	"net"
 	"net/http"
 	"os"
 	"os/exec"
 	"path/filepath"
 	"runtime"
+	"sort"
 	"strings"
 	"sync"
 	"time"
@@ -37,6 +39,7 @@ import (
 	"github.com/ElodineOfficial/GobboNet/internal/autostart"
 	"github.com/ElodineOfficial/GobboNet/internal/catalog"
 	"github.com/ElodineOfficial/GobboNet/internal/config"
+	"github.com/ElodineOfficial/GobboNet/internal/keyring"
 	"github.com/ElodineOfficial/GobboNet/internal/modelfetch"
 )
 
@@ -51,7 +54,11 @@ type Options struct {
 	ServerExe   string // --server-exe: the packaged llama-server the launcher picked
 	NoBrowser   bool   // --no-browser: print the URL instead of opening it
 	Force       bool   // --force: re-run even if setup already completed
-	Out         io.Writer
+	// KeepPassword: `serve` opened this wizard itself -- to finish an abandoned
+	// setup or to offer a chat model -- so an existing password stays. Only an
+	// explicit `gobbonet setup` may replace one.
+	KeepPassword bool
+	Out          io.Writer
 }
 
 // Result reports what the wizard did, so the caller can decide whether there is
@@ -70,6 +77,18 @@ type Result struct {
 // nowhere to put.
 const markerName = "setup-complete.json"
 
+// startedName records that a wizard got as far as accepting a password. Without
+// it an abandoned wizard and a hand-configured install look identical from the
+// config alone -- both have an access_secret and no completion marker -- and
+// cmdServe would serve the half-configured one.
+const startedName = "setup-started"
+
+// declinedName records that the user was offered a chat model and finished
+// without one. A local install with no model cannot chat, and the wizard is the
+// only thing that offers one, so the offer repeats until either a model appears
+// or the user turns it down -- and this is what stops it repeating forever.
+const declinedName = "setup-model-declined"
+
 type marker struct {
 	CompletedAt time.Time `json:"completed_at"`
 	Mode        string    `json:"mode"`
@@ -81,6 +100,24 @@ func Complete(dataDir string) bool {
 	return err == nil
 }
 
+// ModelDeclined reports that the user finished setup without a chat model.
+func ModelDeclined(dataDir string) bool {
+	_, err := os.Stat(filepath.Join(dataDir, declinedName))
+	return err == nil
+}
+
+// ClearModelDeclined forgets that refusal, so an install whose models are later
+// removed is offered one again rather than serving something that cannot chat.
+func ClearModelDeclined(dataDir string) {
+	_ = os.Remove(filepath.Join(dataDir, declinedName))
+}
+
+// Started reports whether a wizard ran far enough to store a password.
+func Started(dataDir string) bool {
+	_, err := os.Stat(filepath.Join(dataDir, startedName))
+	return err == nil
+}
+
 type server struct {
 	opts Options
 	cfg  *config.Config
@@ -89,12 +126,24 @@ type server struct {
 
 	mu           sync.Mutex
 	passwordSet  bool
-	backendMode  string // "local" or "remote"
+	hosts        []string // Host values this wizard answers to: its own loopback address
+	backendMode  string   // "local" or "remote"
 	dl           *modelfetch.Download
 	finishedBody []byte
+	firewallOwed bool
 
 	shutdown     chan struct{}
 	shutdownOnce sync.Once
+}
+
+// takeFirewallJob claims the firewall step, so a double-clicked Finish raises
+// one elevation prompt rather than one per request.
+func (s *server) takeFirewallJob() bool {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	owed := s.firewallOwed
+	s.firewallOwed = false
+	return owed
 }
 
 // Run serves the wizard and returns when the user finishes it.
@@ -122,7 +171,7 @@ func Run(opts Options) (Result, error) {
 		cfg:         &cfg,
 		cat:         cat,
 		out:         opts.Out,
-		passwordSet: auth.SecretConfigured(cfg.AccessSecret),
+		passwordSet: passwordConfigured(cfg),
 		shutdown:    make(chan struct{}),
 	}
 
@@ -134,7 +183,9 @@ func Run(opts Options) (Result, error) {
 	}
 	defer ln.Close()
 
-	url := fmt.Sprintf("http://127.0.0.1:%d/", ln.Addr().(*net.TCPAddr).Port)
+	port := ln.Addr().(*net.TCPAddr).Port
+	url := fmt.Sprintf("http://127.0.0.1:%d/", port)
+	s.hosts = []string{fmt.Sprintf("127.0.0.1:%d", port), fmt.Sprintf("localhost:%d", port)}
 
 	httpSrv := &http.Server{Handler: s.routes()}
 	errc := make(chan error, 1)
@@ -165,6 +216,47 @@ func Run(opts Options) (Result, error) {
 	return Result{}, nil
 }
 
+// guard answers only the wizard's own page. The wizard listens on loopback with
+// no login -- it is what sets the login -- so without this any web page the user
+// has open could post to it (a text/plain form needs no CORS preflight) and a
+// DNS-rebound one could read it back.
+func (s *server) guard(next http.Handler) http.Handler {
+	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if !s.ownHost(r.Host) {
+			writeErr(w, http.StatusForbidden, "Open setup at the address GobboNet printed.")
+			return
+		}
+		if o := r.Header.Get("Origin"); o != "" && !s.ownHost(strings.TrimPrefix(o, "http://")) {
+			writeErr(w, http.StatusForbidden, "Cross-site request refused.")
+			return
+		}
+		if site := r.Header.Get("Sec-Fetch-Site"); site != "" && site != "same-origin" && site != "none" {
+			writeErr(w, http.StatusForbidden, "Cross-site request refused.")
+			return
+		}
+		if r.Method == http.MethodPost {
+			if mt, _, err := mime.ParseMediaType(r.Header.Get("Content-Type")); err != nil || mt != "application/json" {
+				writeErr(w, http.StatusUnsupportedMediaType, "Send JSON.")
+				return
+			}
+		}
+		// Never inside another site's frame: a browser without Sec-Fetch-Site
+		// would otherwise let a page overlay the wizard's own buttons.
+		w.Header().Set("X-Frame-Options", "DENY")
+		w.Header().Set("Content-Security-Policy", "frame-ancestors 'none'")
+		next.ServeHTTP(w, r)
+	})
+}
+
+func (s *server) ownHost(h string) bool {
+	for _, own := range s.hosts {
+		if strings.EqualFold(h, own) {
+			return true
+		}
+	}
+	return false
+}
+
 func (s *server) routes() http.Handler {
 	mux := http.NewServeMux()
 	mux.HandleFunc("/", s.handleIndex)
@@ -173,7 +265,7 @@ func (s *server) routes() http.Handler {
 	mux.HandleFunc("/api/backend", s.handleBackend)
 	mux.HandleFunc("/api/download", s.handleDownload)
 	mux.HandleFunc("/api/finish", s.handleFinish)
-	return mux
+	return s.guard(mux)
 }
 
 func (s *server) handleIndex(w http.ResponseWriter, r *http.Request) {
@@ -186,14 +278,20 @@ func (s *server) handleIndex(w http.ResponseWriter, r *http.Request) {
 }
 
 type stateResponse struct {
-	PasswordSet bool               `json:"password_set"`
-	BackendMode string             `json:"backend_mode"`
-	Models      []catalogModel     `json:"models"`
-	Default     int                `json:"default"`
-	CPUOnly     int                `json:"cpu_only"`
-	HasEngine   bool               `json:"has_engine"`
-	FreeGB      float64            `json:"free_gb"`
-	Download    *modelfetch.Status `json:"download,omitempty"`
+	PasswordSet  bool           `json:"password_set"`
+	BackendMode  string         `json:"backend_mode"`
+	Models       []catalogModel `json:"models"`
+	Default      int            `json:"default"`
+	CPUOnly      int            `json:"cpu_only"`
+	HasEngine    bool           `json:"has_engine"`
+	CanAutostart bool           `json:"can_autostart"`
+	// Whether choosing LAN here will also raise an elevation prompt, so the
+	// wizard can say so before the dialog appears rather than after.
+	FirewallPrompt bool               `json:"firewall_prompt"`
+	FreeGB         float64            `json:"free_gb"`
+	Installed      []string           `json:"installed"`
+	HasEmbed       bool               `json:"has_embed"`
+	Download       *modelfetch.Status `json:"download,omitempty"`
 }
 
 type catalogModel struct {
@@ -204,17 +302,45 @@ type catalogModel struct {
 	File    string  `json:"file"`
 }
 
+// installedModels lists GGUFs already in the model directory. Without it the
+// wizard offers a download to someone who kept their models through an
+// uninstall, and the only way past is a button claiming something the wizard
+// could simply have checked.
+func fileExists(p string) bool {
+	st, err := os.Stat(p)
+	return err == nil && !st.IsDir()
+}
+
+func installedModels(dir string) []string {
+	entries, err := os.ReadDir(dir)
+	if err != nil {
+		return nil
+	}
+	var out []string
+	for _, e := range entries {
+		if !e.IsDir() && strings.HasSuffix(strings.ToLower(e.Name()), ".gguf") {
+			out = append(out, e.Name())
+		}
+	}
+	sort.Strings(out)
+	return out
+}
+
 func (s *server) handleState(w http.ResponseWriter, r *http.Request) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 
 	resp := stateResponse{
-		PasswordSet: s.passwordSet,
-		BackendMode: s.backendMode,
-		Default:     s.cat.Default,
-		CPUOnly:     s.cat.CPUOnly,
-		HasEngine:   s.opts.ServerExe != "",
-		FreeGB:      float64(modelfetch.FreeBytes(s.modelDir())) / (1 << 30),
+		PasswordSet:    s.passwordSet,
+		BackendMode:    s.backendMode,
+		Default:        s.cat.Default,
+		CPUOnly:        s.cat.CPUOnly,
+		HasEngine:      s.opts.ServerExe != "",
+		CanAutostart:   autostart.Supported(),
+		FirewallPrompt: firewallAvailable(),
+		FreeGB:         float64(modelfetch.FreeBytes(s.modelDir())) / (1 << 30),
+		Installed:      installedModels(s.modelDir()),
+		HasEmbed:       fileExists(s.cfg.EmbedModelPath()),
 	}
 	for _, e := range s.cat.Entries {
 		resp.Models = append(resp.Models, catalogModel{
@@ -234,9 +360,23 @@ type passwordRequest struct {
 	Confirm  string `json:"confirm"`
 }
 
+// passwordConfigured: an encrypted install keeps a marker in access_secret, and
+// its keyring is the password check.
+func passwordConfigured(cfg config.Config) bool {
+	return auth.SecretConfigured(cfg.AccessSecret) || keyring.Exists(cfg.KeyringPath())
+}
+
 func (s *server) handlePassword(w http.ResponseWriter, r *http.Request) {
 	var req passwordRequest
 	if !decode(w, r, &req) {
+		return
+	}
+	if keyring.Exists(s.cfg.KeyringPath()) {
+		writeErr(w, http.StatusConflict, "This install's history is encrypted. Change its password with `gobbonet set-password`, which asks for the current one.")
+		return
+	}
+	if s.opts.KeepPassword && s.passwordSet {
+		writeErr(w, http.StatusConflict, "A password is already set. Change it with `gobbonet set-password`.")
 		return
 	}
 	if len(req.Password) < MinPasswordLength {
@@ -269,6 +409,10 @@ func (s *server) handlePassword(w http.ResponseWriter, r *http.Request) {
 	if err == nil {
 		s.cfg.AccessSecret = secret
 		s.passwordSet = true
+		// Best effort: losing this costs a re-entry into the wizard, never a
+		// failure to serve.
+		_ = os.MkdirAll(s.cfg.DataDir, 0o700)
+		_ = os.WriteFile(filepath.Join(s.cfg.DataDir, startedName), []byte("1"), 0o600)
 	}
 	s.mu.Unlock()
 	if err != nil {
@@ -333,7 +477,13 @@ func (s *server) applyBackend(w http.ResponseWriter, req backendRequest) bool {
 				return false
 			}
 		}
-		// server_exe empty is what selects remote mode. Leave it alone.
+		// server_exe empty is what selects remote mode, and a value left by an
+		// earlier local run would silently override this choice: config.Mode()
+		// reads any non-empty value as local.
+		if err := config.Set(s.cfg.Path, "server_exe", ""); err != nil {
+			writeErr(w, http.StatusInternalServerError, err.Error())
+			return false
+		}
 	case "local":
 		if s.opts.ServerExe == "" {
 			writeErr(w, http.StatusBadRequest,
@@ -358,7 +508,8 @@ func (s *server) applyBackend(w http.ResponseWriter, req backendRequest) bool {
 }
 
 type downloadRequest struct {
-	Index int `json:"index"`
+	Index      int  `json:"index"`
+	Embeddings bool `json:"embeddings"`
 }
 
 func (s *server) handleDownload(w http.ResponseWriter, r *http.Request) {
@@ -382,10 +533,20 @@ func (s *server) handleDownload(w http.ResponseWriter, r *http.Request) {
 	if !decode(w, r, &req) {
 		return
 	}
-	entry, ok := s.cat.Find(req.Index)
-	if !ok {
-		writeErr(w, http.StatusBadRequest, "That model is not in the catalogue.")
-		return
+
+	// The retrieval model is not in the catalogue on purpose -- that list is the
+	// chat models the picker offers -- but it goes through the same verified
+	// download so the wizard can poll it with no second code path.
+	var entry catalog.Entry
+	if req.Embeddings {
+		entry = modelfetch.EmbeddingEntry()
+	} else {
+		var ok bool
+		entry, ok = s.cat.Find(req.Index)
+		if !ok {
+			writeErr(w, http.StatusBadRequest, "That model is not in the catalogue.")
+			return
+		}
 	}
 
 	s.mu.Lock()
@@ -395,6 +556,9 @@ func (s *server) handleDownload(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	dir := s.modelDir()
+	if req.Embeddings {
+		dir = filepath.Dir(s.cfg.EmbedModelPath())
+	}
 	s.mu.Unlock()
 
 	// Free space before a byte moves. A 16 GB download that dies at 15 costs
@@ -409,7 +573,7 @@ func (s *server) handleDownload(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	dl := modelfetch.New(entry, dir, modelfetch.RequireChecksum(s.cfg.RequireChecksum))
+	dl := modelfetch.New(entry, dir, modelfetch.RequireChecksum(s.cfg.RequireChecksum || req.Embeddings))
 	s.mu.Lock()
 	s.dl = dl
 	s.mu.Unlock()
@@ -418,7 +582,7 @@ func (s *server) handleDownload(w http.ResponseWriter, r *http.Request) {
 	// Record the model's tuning alongside the choice, the way the NSIS wizard
 	// does — a model picked without its ctx/kv settings loads with the wrong
 	// window and looks like a bad model rather than a missing setting.
-	if entry.Ctx > 0 {
+	if entry.Ctx > 0 && !req.Embeddings {
 		_ = config.Set(s.cfg.Path, "ctx_size", fmt.Sprint(entry.Ctx))
 	}
 	if entry.KV != "" && config.ValidKVCacheType(entry.KV) {
@@ -473,6 +637,39 @@ func (s *server) handleFinish(w http.ResponseWriter, r *http.Request) {
 	w.Header().Set("Content-Type", "application/json")
 	w.WriteHeader(http.StatusOK)
 	_, _ = w.Write(body)
+	// Flush, or the finish text describing the elevation prompt arrives after
+	// it: net/http holds a response this small in a 2 KB buffer until the
+	// handler returns, and ShellExecute below blocks until UAC is answered.
+	if f, ok := w.(http.Flusher); ok {
+		f.Flush()
+	}
+
+	// Outside completeSetup's lock -- s.mu also guards the state endpoint the
+	// wizard polls, and how long someone takes to answer UAC is not a duration
+	// to freeze the page for.
+	if s.takeFirewallJob() {
+		switch err := openFirewall(); {
+		case err == nil:
+		case errors.Is(err, ErrFirewallDeclined):
+			// Declining is an answer, so honour it on both halves rather than
+			// leaving the bind wide. A 0.0.0.0 bind with no rule is what makes
+			// Windows raise its own "Allow access?" dialog at first listen --
+			// a second prompt for the choice just refused, and answering it
+			// writes rules nothing here asked for.
+			fmt.Fprintln(s.out, "  [WARN] The Administrator prompt was declined, so no rule was added.")
+			if err := config.Set(s.cfg.Path, "listen_host", "127.0.0.1"); err != nil {
+				fmt.Fprintf(s.out, "  [WARN] could not switch LAN access back off: %v\n", err)
+			} else {
+				fmt.Fprintln(s.out, "         LAN access is off again; GobboNet will listen on this")
+				fmt.Fprintln(s.out, "         machine only. To turn it on later, right-click")
+				fmt.Fprintln(s.out, "         setup-lan.bat -> Run as administrator, then:")
+				fmt.Fprintln(s.out, "           gobbonet config set listen_host 0.0.0.0")
+			}
+		default:
+			fmt.Fprintf(s.out, "  [WARN] could not run setup-lan.bat: %v\n", err)
+			fmt.Fprintln(s.out, "         Right-click it -> Run as administrator to finish.")
+		}
+	}
 
 	s.shutdownOnce.Do(func() { close(s.shutdown) })
 }
@@ -526,6 +723,8 @@ func (s *server) completeSetup(w http.ResponseWriter, r *http.Request) ([]byte, 
 		writeErr(w, http.StatusInternalServerError, err.Error())
 		return nil, false
 	}
+	// The firewall itself is opened by the caller, once, after the response.
+	s.firewallOwed = bool(req.LAN) && firewallAvailable()
 
 	// Written as this user, into this user's own config — the package cannot
 	// do it, and would be wrong to. A failure here does not fail setup:
@@ -544,6 +743,17 @@ func (s *server) completeSetup(w http.ResponseWriter, r *http.Request) ([]byte, 
 		writeErr(w, http.StatusInternalServerError, err.Error())
 		return nil, false
 	}
+	// A local install with no chat model is finished but not usable, and the
+	// wizard is the only thing that offers one. Record which of the two this
+	// was, so serve can re-offer without pestering someone who chose to keep
+	// their own models or set one up by hand.
+	declined := filepath.Join(s.cfg.DataDir, declinedName)
+	if mode == "local" && len(installedModels(s.modelDir())) == 0 {
+		_ = os.WriteFile(declined, []byte("1"), 0o600)
+	} else {
+		_ = os.Remove(declined)
+	}
+
 	blob, _ := json.MarshalIndent(marker{CompletedAt: time.Now().UTC(), Mode: mode}, "", "  ")
 	if err := os.WriteFile(filepath.Join(s.cfg.DataDir, markerName), blob, 0o600); err != nil {
 		writeErr(w, http.StatusInternalServerError, err.Error())
@@ -555,6 +765,7 @@ func (s *server) completeSetup(w http.ResponseWriter, r *http.Request) ([]byte, 
 		"port":      s.cfg.ListenPort,
 		"host":      host,
 		"autostart": bool(req.Autostart),
+		"firewall":  s.firewallOwed,
 	})
 
 	s.finishedBody = body

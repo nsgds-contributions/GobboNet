@@ -1,4 +1,13 @@
-Now I have the complete picture. Here's the design for the shared config file that bridges both launchers to the Go server.
+# Shared config: how `config.toml` came about
+
+> ⚠ **A design note from the Go migration, not a description of this fork.** It
+> records how one config file came to be shared between the PowerShell, shell and
+> Go runtimes. This fork does not ship the PowerShell path (the files stay in the
+> tree, unchanged from upstream), so for this fork `launch.bat` and
+> `fileserver.ps1` below are history: `config.toml` is written by the web wizard
+> in `internal/setup` and read by the Go server, on every platform.
+
+The design for the shared config file that bridges both launchers to the Go server.
 
 ---
 

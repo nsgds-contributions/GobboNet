@@ -162,7 +162,12 @@ function renderMessages() {
 
   if (!thread) {
     title.textContent = 'GOBBONET';
+    // On wide screens these lists scroll on their own, and this rebuild runs on
+    // every 5s status poll and card click. Carry their positions across it.
+    const landingLists = () => container.querySelectorAll('.landing-page .landing-sched-list, .landing-page .landing-char-list');
+    const kept = Array.from(landingLists(), el => el.scrollTop);
     container.innerHTML = renderLandingPage();
+    landingLists().forEach((el, i) => { if (kept[i]) el.scrollTop = kept[i]; });
     const homeBtn = document.getElementById('home-btn');
     if (homeBtn) homeBtn.classList.add('hidden');
     return;

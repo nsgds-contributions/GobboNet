@@ -1,9 +1,11 @@
 // Command gobbonet serves the chat UI, proxies to llama.cpp, and — in local
 // mode — supervises the llama-server process.
 //
-// This replaces launch.bat's runtime half. The setup half (hardware probe, model
-// download) stays in the launcher scripts for now; those are one-time
-// interactive flows, not drift-prone hot paths.
+// This replaces launch.bat's runtime half on every platform. This fork's
+// Windows installer does not ship launch.bat (it stays in the tree, unchanged,
+// to track upstream); of the setup half only the hardware probe is still a
+// script, and the password, backend, model and retrieval-model choices are the
+// web wizard in internal/setup, which is what the Linux packages already used.
 //
 //	gobbonet                          serve using the discovered config
 //	gobbonet serve --config PATH      serve using a specific config
@@ -26,7 +28,9 @@ import (
 	"os"
 	"os/signal"
 	"path/filepath"
+	"runtime"
 	"strings"
+	"sync"
 	"syscall"
 	"time"
 
@@ -156,6 +160,8 @@ func run(argv []string) error {
 		return cmdAutostart(argv)
 	case "check":
 		return cmdCheck(argv)
+	case "fetch-embeddings":
+		return cmdFetchEmbeddings(argv)
 	case "doctor":
 		return cmdDoctor(argv)
 	case "engine":
@@ -191,6 +197,7 @@ func usage() {
   gobbonet check [--config PATH]
   gobbonet doctor [--config PATH]
   gobbonet engine install|status [--config PATH] [--dir PATH]
+  gobbonet fetch-embeddings [--config PATH] [--force]
   gobbonet config get [--config PATH] <key>
   gobbonet config set [--config PATH] <key> <value>
   gobbonet config keys
@@ -230,6 +237,19 @@ func stringFlag(fs *flag.FlagSet, name, usage string) *string {
 }
 
 // --- serve -----------------------------------------------------------------
+
+// canRunWizard reports whether there is anyone to run it for. Without this a
+// systemd unit or container running bare gobbonet with no password would block
+// forever on a loopback URL nobody can open, where it used to fail fast.
+func canRunWizard() bool {
+	if runtime.GOOS == "windows" {
+		return true
+	}
+	if term.IsTerminal(int(os.Stdin.Fd())) {
+		return true
+	}
+	return os.Getenv("DISPLAY") != "" || os.Getenv("WAYLAND_DISPLAY") != ""
+}
 
 func cmdServe(argv []string) error {
 	restoreConsole := setupConsolePresentation()
@@ -282,6 +302,35 @@ func cmdServe(argv []string) error {
 		return err
 	}
 	defer guard.Close()
+
+	// Bare `gobbonet` is the only spelling that can be right on a first run, a
+	// normal run and an upgrade alike, because a Windows shortcut cannot branch.
+	// An unset access_secret is the extra condition: the marker is absent on any
+	// install configured by hand with `config set` + `set-password`, and those
+	// must keep serving rather than being sent back through the wizard.
+	// Three ways in: setup never ran; a wizard was abandoned after the password;
+	// or it finished in local mode with no chat model, which is complete but
+	// cannot chat and has no other route to fix itself.
+	firstRun := !setup.Complete(cfg.DataDir) &&
+		(cfg.AccessSecret == "" || setup.Started(cfg.DataDir))
+	// A local install with no chat model cannot chat, and nothing but the wizard
+	// offers one. Offer it -- unless the user already turned that offer down,
+	// which is the only thing that would make repeating it pestering. That
+	// refusal is forgotten as soon as a model exists again, so removing the
+	// models later brings the offer back.
+	haveModel := len(config.GGUFsIn(cfg.ModelDir)) > 0
+	if haveModel {
+		setup.ClearModelDeclined(cfg.DataDir)
+	}
+	modelGone := cfg.ServerExe != "" && !haveModel && !setup.ModelDeclined(cfg.DataDir)
+	if !*noAuth && (firstRun || modelGone) && canRunWizard() {
+		if err := firstRunSetup(cfg.Path, modelGone); err != nil {
+			return err
+		}
+		if cfg, err = loadConfig(cfg.Path); err != nil {
+			return err
+		}
+	}
 
 	if err := cfg.Runnable(); err != nil {
 		return err
@@ -394,12 +443,71 @@ func cmdServe(argv []string) error {
 	if err != nil {
 		return err
 	}
-	defer srv.Shutdown()
+	// Once only: the signal handler and the defers below can both reach it, and
+	// Server.Shutdown is not safe to run twice at the same time.
+	shutdown := sync.OnceFunc(srv.Shutdown)
+	defer shutdown()
 
 	// Serving is the one command that genuinely needs the frontend, so this is
 	// where its absence becomes an error. See internal/server/webroot.go.
 	if srv.WebMissing() {
 		return server.ErrNoWebAssets
+	}
+
+	// Started in both modes on purpose. Remote mode means somebody else runs the
+	// chat engine, not that retrieval stops mattering, and the bundled engine is
+	// sitting right here either way.
+	var emb *supervisor.Embedder
+	if cfg.EmbedEnable {
+		exe := cfg.EmbedExe
+		if exe == "" {
+			exe = cfg.ServerExe
+		}
+		if exe == "" {
+			exe = config.DiscoverServerExe()
+		}
+		emb = supervisor.NewEmbedder(supervisor.EmbedOptions{
+			Exe:     exe,
+			Model:   cfg.EmbedModelPath(),
+			URL:     cfg.EmbedURL,
+			LogFile: filepath.Join(cfg.DataDir, "embed-server.log"),
+		})
+	}
+
+	// Catch Ctrl+C and SIGTERM before either child exists, not after the bind.
+	// Both run in their own process group, so a terminal's Ctrl+C reaches only
+	// this process, and with no handler yet Go exits without running a defer:
+	// a signal during the model load -- up to minutes -- orphaned the embedding
+	// server and llama-server, and the next start found both ports taken.
+	// srv.Shutdown is safe mid-Boot: it ends Boot's wait before stopping the
+	// engine. os.Exit skips the defers below, so the handler does its own.
+	stop := make(chan os.Signal, 1)
+	shutting := make(chan struct{})
+	signal.Notify(stop, os.Interrupt, syscall.SIGTERM)
+	go func() {
+		<-stop
+		close(shutting)
+		fmt.Println("\n [..] shutting down")
+		shutdown()
+		emb.Stop()
+		os.Exit(0)
+	}()
+	// A stop that lands mid-startup ends Boot early, and startup would carry on
+	// regardless -- binding, printing the ready panel, opening a browser --
+	// until the handler's os.Exit caught up. Park instead.
+	parkIfStopping := func() {
+		select {
+		case <-shutting:
+			select {}
+		default:
+		}
+	}
+
+	if emb != nil {
+		if err := emb.Start(); err != nil {
+			fmt.Printf(" [!]  embeddings: %v\n", err)
+		}
+		defer emb.Stop()
 	}
 
 	fmt.Printf(" [OK] mode: %s\n", mode)
@@ -439,6 +547,7 @@ func cmdServe(argv []string) error {
 			fmt.Println("      The engine's own output follows, marked [llama].")
 		}
 		if err := sup.Boot(*modelFile); err != nil {
+			parkIfStopping()
 			// Not fatal. The UI still loads and reports the problem, and the
 			// user can pick a different model from the dropdown — which is more
 			// useful than exiting and making them read a log.
@@ -466,6 +575,8 @@ func cmdServe(argv []string) error {
 			fmt.Printf(" [OK] model: %s (family=%s, thinking=%s)\n", rec.Name, rec.Family, rec.ThinkingFormat)
 		}
 	}
+
+	parkIfStopping()
 
 	// Bind before the banner. A port that is already taken is the single most
 	// common startup failure and it used to print underneath "[OK] serving on
@@ -505,6 +616,9 @@ func cmdServe(argv []string) error {
 	// last prominent thing printed before the browser opens.
 	fmt.Printf(" [OK] data dir: %s\n", cfg.DataDir)
 	printReadyPanel(os.Stdout, cfg, bind, server.LANAddrsFor(bind.Host))
+	if bind.LANReachable() {
+		warnIfFirewallClosed(bind.Port)
+	}
 
 	// After the bind, so the tab never lands on a connection error: the socket
 	// is already accepting and anything that arrives before Serve starts waits
@@ -522,19 +636,7 @@ func cmdServe(argv []string) error {
 	// Ctrl+C. Serve returns on a listener error too, and that path used to
 	// leave the child running: gobbonet exits, llama-server keeps the GPU and
 	// the port, and the next launch cannot bind.
-	defer srv.Shutdown()
-
-	// Stop the managed llama-server on Ctrl+C. Without this the child keeps the
-	// GPU allocated after we exit. os.Exit skips the defer above, so the
-	// handler does its own shutdown rather than relying on it.
-	stop := make(chan os.Signal, 1)
-	signal.Notify(stop, os.Interrupt, syscall.SIGTERM)
-	go func() {
-		<-stop
-		fmt.Println("\n [..] shutting down")
-		srv.Shutdown()
-		os.Exit(0)
-	}()
+	defer shutdown()
 
 	return srv.Serve(bind.Listener)
 }

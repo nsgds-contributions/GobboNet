@@ -218,9 +218,10 @@ echo "  engine:   $LLAMA_BUILD ($LLAMA_BACKEND) -- $ENGINE_VERIFIED"
 # can a user replacing files afterwards. build-release.sh runs stage-web.sh
 # before building the .exe this script bundles.
 
-# Scripts kept from the Windows lineage. launch.bat still owns adding further
-# models; hardware-probe.ps1 is called by the installer's probe page.
-for f in launch.bat setup-lan.bat teardown-lan.bat stop-gobbonet.bat hardware-probe.ps1 identify-model.ps1 fileserver.ps1; do
+# Scripts the installed program uses: the probe page runs hardware-probe.ps1,
+# the wizard runs setup-lan.bat, the uninstaller runs teardown-lan.bat, and
+# SecMain runs stop-gobbonet.bat before overwriting a running install.
+for f in setup-lan.bat teardown-lan.bat stop-gobbonet.bat hardware-probe.ps1; do
     [ -f "$ROOT/$f" ] || { echo "ERROR: $f missing from $ROOT" >&2; exit 1; }
     cp "$ROOT/$f" "$PAYLOAD/$f"
 done

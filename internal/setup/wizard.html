@@ -66,6 +66,8 @@
   .log { font-family: ui-monospace, Menlo, Consolas, monospace; font-size: 13px; color: var(--accent); }
   .brand { color: var(--quiet); font-size: 12.5px; text-align: center; margin-top: 34px; }
   .note { color: var(--muted); font-size: 13.5px; }
+  .have { border: 1px solid var(--accent); border-radius: 8px; padding: 10px 12px;
+          margin: 12px 0; color: var(--accent); font-size: 14px; }
   ol.steps { list-style: none; padding: 0; margin: 0 0 26px; display: flex; gap: 7px; }
   ol.steps li { flex: 1; height: 3px; background: #262b35; border-radius: 2px; }
   ol.steps li.on { background: var(--accent); }
@@ -123,12 +125,32 @@
     </div>
   </section>
 
+  <!-- 2b. retrieval ------------------------------------------------------ -->
+  <section class="step" id="s2b">
+    <div class="card">
+      <h2>Searching your notes by meaning</h2>
+      <p>Character notes and lore can be found by what they mean, not just by
+         keywords you remember to tag. That needs a second, small model:
+         146 MB, downloaded once, and it runs alongside the chat.</p>
+      <p class="note">Skip it and keyword tags still work. Nothing else changes,
+         and you can add it later with <code>gobbonet fetch-embeddings</code>.</p>
+      <div class="have" id="emhave" style="display:none"></div>
+      <div class="bar"><i id="embar"></i></div>
+      <div class="log" id="emlog"></div>
+      <div class="row">
+        <button id="b2bget">Download it (146 MB)</button>
+        <button id="b2bskip" class="ghost">Skip</button>
+      </div>
+    </div>
+  </section>
+
   <!-- 3. model ---------------------------------------------------------- -->
   <section class="step" id="s3">
     <div class="card">
       <h2>Pick a model</h2>
       <p class="note" id="freenote"></p>
       <div id="models"></div>
+      <div class="have" id="haveal" style="display:none"></div>
       <div class="row">
         <button id="b3">Download</button>
         <button class="ghost" id="b3skip">I already have one</button>
@@ -162,6 +184,7 @@
       <div class="choice" id="c-lanon" data-lan="on">
         <div class="t">Allow devices on my network</div>
         <div class="d">Binds 0.0.0.0. Anyone on the LAN who knows the password can connect.</div>
+        <div class="d" id="lanfw" style="display:none"></div>
       </div>
       <h2 style="margin-top:26px">Start at login</h2>
       <p>Off by default. GobboNet is a server, and one that starts itself every
@@ -197,7 +220,7 @@
 
   function $(id) { return document.getElementById(id); }
   function show(n) {
-    ["s1","s2","s3","s4","s5","s6"].forEach(function (s, i) {
+    ["s1","s2","s2b","s3","s4","s5","s6"].forEach(function (s, i) {
       $(s).classList.toggle("active", i === n - 1);
     });
     var marks = $("bar").children;
@@ -222,6 +245,24 @@
 
   fetch("/api/state").then(function (r) { return r.json(); }).then(function (s) {
     state = s;
+    showInstalled(s.installed);
+    if (s.has_embed) {
+      $("emhave").style.display = "block";
+      $("emhave").textContent =
+        "\u2713 Already downloaded — this step is done, nothing to fetch.";
+      $("b2bget").style.display = "none";
+      $("b2bskip").textContent = "Continue";
+    }
+    if (s.firewall_prompt) {
+      $("lanfw").style.display = "block";
+      $("lanfw").textContent =
+        "Windows will ask for Administrator once, to open the firewall. " +
+        "Without that the phone still cannot connect.";
+    }
+    if (s.can_autostart === false) {
+      var as = $("c-ason");
+      if (as) as.style.display = "none";
+    }
     if (!s.has_engine) {
       $("c-local").querySelector(".d").textContent =
         "This install has no bundled engine.";
@@ -270,16 +311,69 @@
 
   $("b2").onclick = function () {
     post("/api/backend", { mode: mode, url: $("rurl").value, key: $("rkey").value })
-      .then(function () { show(mode === "remote" ? 5 : 3); })
+      .then(function () { show(3); })
       .catch(function (e) { fail(e.message); });
   };
 
-  $("b3skip").onclick = function () { show(5); };
+  // Downloaded here rather than queued behind the chat model. It is small
+  // enough that inline costs under a minute, the button then does what it says,
+  // and local and remote take the same path -- the split behind one label was
+  // what made this look broken.
+  function afterRetrieval() {
+    show(mode === "remote" ? 6 : 4);
+  }
+
+  $("b2bskip").onclick = afterRetrieval;
+
+  $("b2bget").onclick = function () {
+    $("b2bget").disabled = true;
+    $("b2bskip").disabled = true;
+    $("emlog").textContent = "starting…";
+    post("/api/download", { embeddings: true }).then(function () {
+      var p = setInterval(function () {
+        fetch("/api/download").then(function (r) { return r.json(); }).then(function (d) {
+          if (d.state === "running") {
+            $("embar").style.width = (d.percent || 0) + "%";
+            $("emlog").textContent = (d.done >> 20) + " MB of " + (d.total >> 20) +
+              " MB — " + (d.percent || 0).toFixed(0) + "%";
+          } else if (d.state === "done") {
+            clearInterval(p);
+            $("embar").style.width = "100%";
+            $("emlog").textContent = "Downloaded and verified.";
+            afterRetrieval();
+          } else if (d.state === "error") {
+            clearInterval(p);
+            $("emlog").textContent = "";
+            fail(d.message);
+            $("b2bskip").disabled = false;
+          }
+        });
+      }, 700);
+    }).catch(function (e) {
+      $("b2bget").disabled = false;
+      $("b2bskip").disabled = false;
+      fail(e.message);
+    });
+  };
+
+  $("b3skip").onclick = function () { show(6); };
+
+  // Models kept through an uninstall: say so, rather than making the user
+  // assert it with a button the wizard could have checked itself.
+  function showInstalled(list) {
+    if (!list || !list.length) return;
+    var box = $("haveal");
+    box.style.display = "block";
+    box.textContent = list.length === 1
+      ? "\u2713 Already downloaded: " + list[0] + " — you do not need to download anything here."
+      : "\u2713 Already downloaded: " + list.join(", ") + " — you do not need to download anything here.";
+    $("b3skip").textContent = "Keep what I have";
+  }
 
   $("b3").onclick = function () {
     if (pick === null) return fail("Choose a model first.");
     post("/api/download", { index: pick }).then(function () {
-      show(4);
+      show(5);
       poll = setInterval(tick, 700);
       tick();
     }).catch(function (e) { fail(e.message); });
@@ -307,7 +401,8 @@
     });
   }
 
-  $("b4").onclick = function () { show(5); };
+  $("b4").onclick = function () { show(6); };
+
 
   [["c-lanoff", "off"], ["c-lanon", "on"]].forEach(function (pair) {
     $(pair[0]).onclick = function () {
@@ -334,8 +429,9 @@
         "Setup is complete. The chat opens at http://" +
         (j.host === "0.0.0.0" ? "127.0.0.1" : j.host) + ":" + j.port +
         " — this window can be closed." +
-        (j.autostart ? " GobboNet will also start when you log in." : "");
-      show(6);
+        (j.autostart ? " GobboNet will also start when you log in." : "") +
+        (j.firewall ? " Approve the Administrator prompt to finish opening the firewall." : "");
+      show(7);
     }).catch(function (e) { $("b5").disabled = false; fail(e.message); });
   };
 })();
