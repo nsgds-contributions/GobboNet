@@ -331,9 +331,9 @@ skipped past it, this is that.
 ### Other symptoms worth knowing
 
 - **SmartScreen: "Windows protected your PC"** on the installer. It is
-  unsigned — **More info → Run anyway**. If a `.sha256` was published beside the
-  download, check the file against it; this fork does not publish releases, so
-  there may not be one.
+  unsigned — **More info → Run anyway**. Check it against the release's
+  `SHA256SUMS`, or better, `gh attestation verify` it — see
+  [`VERIFY.md`](VERIFY.md).
 - **`gobbonet.exe` does nothing at all when run.** Antivirus quarantine.
   Check your antivirus protection history first — a quarantined file is listed
   there with a timestamp. (The old AppLocker/WDAC script-policy cause went with
